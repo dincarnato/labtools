@@ -1,3 +1,3 @@
 # IncaRNAto lab's tools
 
-Various tools and data analysis scripts used by the IncaRNAto lab
+cm-builder: automaGically builds Infernal's CMs starting from a single sequence+structure and iteratively refining the model by searching against a database of related sequences
