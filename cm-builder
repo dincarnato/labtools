@@ -11,9 +11,8 @@ use Data::Sequence::Utils;
 $|++;
 
 my ($help, $motiffile, $iterations, $dbfile,
-    $motifio, $motif, $dbio, $tmpdir,
-    $ret, $basename, $id, $output,
-    $haspk, $press, $keepaln, $path);
+    $motifio, $dbio, $tmpdir, $output,
+    $press, $keepaln, $path);
 
 do {
     
@@ -68,92 +67,61 @@ $dbio = Data::IO::Sequence->new(file => $dbfile);
 
 while($dbio->read()) { } # Runtime build index
 
-print "\n[+] Generating initial Stockholm motif file...\n";
+print "\n[+] Reading motifs from file...";
 
-if ($motif = $motifio->read()) { $haspk = fasta2stockholm($motif); }
-else { die "\n[!] Error: Unable to read motif from file\n\n"; }
+while(my $motif = $motifio->read()) {
 
-$id = $motif->id();
-$basename = $tmpdir . $id;
-
-foreach my $iter (1 .. $iterations) {
+    print "\n[+] Starting processing motif " . $motif->id();
+    print "\n[+] Generating initial Stockholm motif file...\n";
     
-    my (%matches, %seen);
-
-    print "[+] Building covariance model (iteration " . $iter . ")...\n" .
-          "    Output from cmbuild:\n\n";
+    my ($ret, $basename, $id, $haspk);
+    $haspk = fasta2stockholm($motif);
+    $id = $motif->id();
+    $basename = $tmpdir . $id;
     
-    $ret = `$path/cmbuild -F $basename.cm $basename.stockholm`;
-    $ret =~ s/^/    /gm;
-    print $ret;
-    
-    if ($haspk) {
+    foreach my $iter (1 .. $iterations) {
         
-        print "\n[+] Building pseudoknot covariance model (iteration " . $iter . ")...\n" .
+        my (%matches, %seen);
+    
+        print "[+] Building covariance model (iteration " . $iter . ")...\n" .
               "    Output from cmbuild:\n\n";
-          
-        $ret = `$path/cmbuild -F $basename.pk.cm $basename.pk.stockholm`;
+        
+        $ret = `$path/cmbuild -F $basename.cm $basename.stockholm`;
         $ret =~ s/^/    /gm;
         print $ret;
         
-    }
-    
-    print "\n[+] Calibrating covariance model (may take a while)...\n" .
-          "    Output from cmcalibrate:\n\n";
-    
-    $ret = `$path/cmcalibrate $basename.cm`;
-    $ret =~ s/^/    /gm;
-    print $ret;
-    
-    if ($haspk) {
-        
-        print "\n[+] Calibrating pseudoknot covariance model (may take a while)...\n" .
-              "    Output from cmcalibrate:\n\n";
-    
-        $ret = `$path/cmcalibrate $basename.pk.cm`;
-        $ret =~ s/^/    /gm;
-        print $ret;
-        
-    }
-    
-    print "\n[+] Searching DB with covariance model...";
-          
-    $ret = `$path/cmsearch --mid $basename.cm $dbfile`;
-    
-    for (split(/\n>>/, $ret)) {
-        
-        next if ($_ =~ m/Hit alignments/);
-        
-        my ($refid, $start, $end, @entry);
-        @entry = split(/\n/, $_);
-        
-        for(my $i = 0; $i < @entry; $i++) {
+        if ($haspk) {
             
-            if ($entry[$i] =~ m/$id\s+\d+\s+\S+\s+\d+/i) {
-             
-                my ($mid, $mstart, $mend) = $entry[$i+2] =~ m/(\S+)\s+(\d+)\s+\S+\s+(\d+)/i;
-                $refid = $mid;
-                
-                $start = $mstart if (!defined $start);
-                $end = $mend;
-                
-            }
+            print "\n[+] Building pseudoknot covariance model (iteration " . $iter . ")...\n" .
+                  "    Output from cmbuild:\n\n";
+              
+            $ret = `$path/cmbuild -F $basename.pk.cm $basename.pk.stockholm`;
+            $ret =~ s/^/    /gm;
+            print $ret;
             
         }
         
-        next if ($start > $end); # Avoid reverse-complemented matches
+        print "\n[+] Calibrating covariance model (may take a while)...\n" .
+              "    Output from cmcalibrate:\n\n";
         
-        $start--;
-        $end--;
-        $matches{$refid} = [$start, $end];
+        $ret = `$path/cmcalibrate $basename.cm`;
+        $ret =~ s/^/    /gm;
+        print $ret;
         
-    }
-    
-    if ($haspk) {
+        if ($haspk) {
+            
+            print "\n[+] Calibrating pseudoknot covariance model (may take a while)...\n" .
+                  "    Output from cmcalibrate:\n\n";
         
-        print "\n[+] Re-searching DB with pseudoknot covariance model...";
+            $ret = `$path/cmcalibrate $basename.pk.cm`;
+            $ret =~ s/^/    /gm;
+            print $ret;
+            
+        }
+        
+        print "\n[+] Searching DB with covariance model...";
               
-        $ret = `$path/cmsearch --mid $basename.pk.cm $dbfile`;
+        $ret = `$path/cmsearch --mid $basename.cm $dbfile`;
         
         for (split(/\n>>/, $ret)) {
             
@@ -180,133 +148,178 @@ foreach my $iter (1 .. $iterations) {
             
             $start--;
             $end--;
-            
-            $matches{$refid} = exists $matches{$refid} ? [@{$matches{$refid}}, $start, $end] : [$start, $end];
+            $matches{$refid} = [$start, $end];
             
         }
         
-        for (keys %matches) {
+        if ($haspk) {
             
-            if (@{$matches{$_}} != 4) {
+            print "\n[+] Re-searching DB with pseudoknot covariance model...";
+                  
+            $ret = `$path/cmsearch --mid $basename.pk.cm $dbfile`;
+            
+            for (split(/\n>>/, $ret)) {
                 
-                delete($matches{$_});
+                next if ($_ =~ m/Hit alignments/);
                 
-                next;
+                my ($refid, $start, $end, @entry);
+                @entry = split(/\n/, $_);
+                
+                for(my $i = 0; $i < @entry; $i++) {
+                    
+                    if ($entry[$i] =~ m/$id\s+\d+\s+\S+\s+\d+/i) {
+                     
+                        my ($mid, $mstart, $mend) = $entry[$i+2] =~ m/(\S+)\s+(\d+)\s+\S+\s+(\d+)/i;
+                        $refid = $mid;
+                        
+                        $start = $mstart if (!defined $start);
+                        $end = $mend;
+                        
+                    }
+                    
+                }
+                
+                next if ($start > $end); # Avoid reverse-complemented matches
+                
+                $start--;
+                $end--;
+                
+                $matches{$refid} = exists $matches{$refid} ? [@{$matches{$refid}}, $start, $end] : [$start, $end];
                 
             }
-        
-            if (intersect([@{$matches{$_}}[0,1]], [@{$matches{$_}}[2,3]])) { $matches{$_} = [ min(@{$matches{$_}}[0,2]), max(@{$matches{$_}}[1,3]) ]; }
-            else { delete($matches{$_}); }
+            
+            for (keys %matches) {
+                
+                if (@{$matches{$_}} != 4) {
+                    
+                    delete($matches{$_});
+                    
+                    next;
+                    
+                }
+            
+                if (intersect([@{$matches{$_}}[0,1]], [@{$matches{$_}}[2,3]])) { $matches{$_} = [ min(@{$matches{$_}}[0,2]), max(@{$matches{$_}}[1,3]) ]; }
+                else { delete($matches{$_}); }
+                
+            }
             
         }
         
-    }
-    
-    $matches{$_} = substr($dbio->read($_)->sequence(), $matches{$_}->[0], $matches{$_}->[1] - $matches{$_}->[0] + 1) for (keys %matches);
-    
-    print " " . keys(%matches) . " matches found.";
-    
-    die "\n\n[!] Error: No matches for motif. Something went wrong...\n\n" unless(keys %matches);
-    
-    #if ($nodup) {
-    #    
-    #    print "\n[+] Removing duplicate sequences...";
-    #    
-    #    foreach my $refid (keys %matches) {
-    #        
-    #        delete($matches{$refid}) if (exists $seen{$matches{$refid}});
-    #        
-    #        $seen{$matches{$refid}} = 1;
-    #        
-    #    }
-    #    
-    #    print " " . keys(%matches) . " matches left.";
-    #    
-    #    die "\n\n[!] Error: No matches for motif. Something went wrong...\n\n" unless(keys %matches);
-    #    
-    #}
-    
-    print "\n[+] Writing matches to FASTA file";
-    
-    open(my $wh, ">", $basename . ".fasta") or die "\n[!] Error: Unable to write sequences to FASTA file ($!)\n\n";
-    print $wh ">" . $_ . "\n" . $matches{$_} . "\n" for (keys %matches);
-    close($wh);
-    
-    print "\n[+] Aligning matches to covariance model...\n" .
-          "    Output from cmalign:\n\n";
-    
-    unlink($basename . ".stockholm");
-    $ret = `$path/cmalign --noprob -o $basename.stockholm $basename.cm $basename.fasta`;
-    $ret =~ s/^/    /gm;
-    print $ret . "\n";
-    
-    if ($haspk) {
+        $matches{$_} = substr($dbio->read($_)->sequence(), $matches{$_}->[0], $matches{$_}->[1] - $matches{$_}->[0] + 1) for (keys %matches);
         
-        print "\n[+] Aligning matches to pseudoknot covariance model...\n" .
+        print " " . keys(%matches) . " matches found.";
+        
+        if (!keys %matches) {
+            
+            print "\n\n[!] Error: No matches for motif. Something went wrong...\n\n";
+            
+            unlink glob $basename . ".*";
+            
+            next;
+            
+        }
+        
+        #if ($nodup) {
+        #    
+        #    print "\n[+] Removing duplicate sequences...";
+        #    
+        #    foreach my $refid (keys %matches) {
+        #        
+        #        delete($matches{$refid}) if (exists $seen{$matches{$refid}});
+        #        
+        #        $seen{$matches{$refid}} = 1;
+        #        
+        #    }
+        #    
+        #    print " " . keys(%matches) . " matches left.";
+        #    
+        #    die "\n\n[!] Error: No matches for motif. Something went wrong...\n\n" unless(keys %matches);
+        #    
+        #}
+        
+        print "\n[+] Writing matches to FASTA file";
+        
+        open(my $wh, ">", $basename . ".fasta") or die "\n[!] Error: Unable to write sequences to FASTA file ($!)\n\n";
+        print $wh ">" . $_ . "\n" . $matches{$_} . "\n" for (keys %matches);
+        close($wh);
+        
+        print "\n[+] Aligning matches to covariance model...\n" .
               "    Output from cmalign:\n\n";
         
-        unlink($basename . ".pk.stockholm");
-        $ret = `$path/cmalign --noprob -o $basename.pk.stockholm $basename.pk.cm $basename.fasta`;
+        unlink($basename . ".stockholm");
+        $ret = `$path/cmalign --noprob -o $basename.stockholm $basename.cm $basename.fasta`;
         $ret =~ s/^/    /gm;
         print $ret . "\n";
         
+        if ($haspk) {
+            
+            print "\n[+] Aligning matches to pseudoknot covariance model...\n" .
+                  "    Output from cmalign:\n\n";
+            
+            unlink($basename . ".pk.stockholm");
+            $ret = `$path/cmalign --noprob -o $basename.pk.stockholm $basename.pk.cm $basename.fasta`;
+            $ret =~ s/^/    /gm;
+            print $ret . "\n";
+            
+        }
+    
     }
-
-}
-
-unlink glob $output . $id . ".cm.*";
-unlink glob $output . $id . ".pk.cm.*" if ($haspk);
-
-print "[+] Building final covariance model...\n" .
-          "    Output from cmbuild:\n\n";
     
-$ret = `$path/cmbuild -F $output$id.cm $basename.stockholm`;
-$ret =~ s/^/    /gm;
-print $ret;
-
-if ($haspk) {
+    unlink glob $output . $id . ".cm.*";
+    unlink glob $output . $id . ".pk.cm.*" if ($haspk);
     
-    print "\n[+] Building final pseudoknot covariance model...\n" .
+    print "[+] Building final covariance model...\n" .
               "    Output from cmbuild:\n\n";
         
-    $ret = `$path/cmbuild -F $output$id.pk.cm $basename.pk.stockholm`;
-    $ret =~ s/^/    /gm;
-    print $ret;
-    
-}
-
-if ($keepaln) {
-    
-    system("cp " . $basename . ".stockholm .");
-    system("cp " . $basename . ".pk.stockholm .") if ($haspk);
-    
-}
-
-if ($press) {
-
-    print "\n[+] Pressing covariance model...\n" .
-              "    Output from cmpress:\n\n";
-        
-    $ret = `$path/cmpress -F $output$id.cm`;
+    $ret = `$path/cmbuild -F $output$id.cm $basename.stockholm`;
     $ret =~ s/^/    /gm;
     print $ret;
     
     if ($haspk) {
+        
+        print "\n[+] Building final pseudoknot covariance model...\n" .
+                  "    Output from cmbuild:\n\n";
             
-        print "\n[+] Pressing pseudoknot covariance model...\n" .
-                  "    Output from cmpress:\n\n";
-            
-        $ret = `$path/cmpress -F $output$id.pk.cm`;
+        $ret = `$path/cmbuild -F $output$id.pk.cm $basename.pk.stockholm`;
         $ret =~ s/^/    /gm;
         print $ret;
         
     }
     
+    if ($keepaln) {
+        
+        system("cp " . $basename . ".stockholm .");
+        system("cp " . $basename . ".pk.stockholm .") if ($haspk);
+        
+    }
+    
+    if ($press) {
+    
+        print "\n[+] Pressing covariance model...\n" .
+                  "    Output from cmpress:\n\n";
+            
+        $ret = `$path/cmpress -F $output$id.cm`;
+        $ret =~ s/^/    /gm;
+        print $ret;
+        
+        if ($haspk) {
+                
+            print "\n[+] Pressing pseudoknot covariance model...\n" .
+                      "    Output from cmpress:\n\n";
+                
+            $ret = `$path/cmpress -F $output$id.pk.cm`;
+            $ret =~ s/^/    /gm;
+            print $ret;
+            
+        }
+        
+    }
+    
+    print "\n[+] Cleaning up...";
+    
+    unlink glob $basename . ".*";
+
 }
-
-print "\n[+] Cleaning up...";
-
-unlink glob $basename . ".*";
 
 print "\n[+] All done.\n\n";
 
@@ -371,7 +384,7 @@ sub help {
  CM Builder (v$Core::Utils::VERSION)
     
  Author:  Danny Incarnato (dincarnato[at]rnaframework.com)
- Summary: Automatically builds and refines Infernal's RNA covariance models
+ Summary: AutomaGically builds and refines Infernal's RNA covariance models
  
  Usage:   cm-builder [Options]
  
