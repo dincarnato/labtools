@@ -29,7 +29,7 @@ do {
                 "P|path-to-infernal=s" => \$path ) or help(1);
 
 };
-
+    
 help() if ($help);
 
 $tmpdir ||= "/tmp/";
