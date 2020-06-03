@@ -112,7 +112,8 @@ MOTIF:
 while (my $motif = $motifio->read()) {
     
     my ($haspk, $id, $basename, $ret,
-        $motiflen, $mstart, $mend);
+        $motiflen, $mstart, $mend, $eta,
+        @eta);
     $haspk = fasta2stockholm($motif);
     
     $id = $motif->id();
@@ -136,8 +137,6 @@ while (my $motif = $motifio->read()) {
     foreach my $iter (1 .. $iterations) {
         
         my (%matches, %seen);
-	
-        #$evalue = 10 if ($iter == $iterations);
     
         print "\n[+] Building covariance model (iteration " . $iter . ")...\n" .
               "    Output from cmbuild:\n\n";
@@ -146,7 +145,11 @@ while (my $motif = $motifio->read()) {
         $ret =~ s/^/    /gm;
         print $ret;
         
-        print "\n[+] Calibrating covariance model (may take a while)...\n" .
+        $ret = `$path/cmcalibrate --forecast --nforecast $threads $basename.cm`;
+        (@eta) = $ret =~ m/(\d{2}):(\d{2}):(\d{2})/;
+        $eta = $eta[0] ? $eta[0] . " h and " . $eta[1] . " min" : $eta[1] . " min and " . $eta[2] . " sec";
+        
+        print "\n[+] Calibrating covariance model (estimated time: " . $eta . ")...\n" .
               "    Output from cmcalibrate:\n\n";
         
         $ret = `$path/cmcalibrate --cpu $threads $basename.cm`;
@@ -228,7 +231,7 @@ while (my $motif = $motifio->read()) {
         unlink($basename . ".stockholm");
         $ret = `$path/cmalign --cpu $threads --noprob -o $basename.stockholm $basename.cm $basename.fasta`;
         $ret =~ s/^/    /gm;
-        print $ret . "\n";
+        print $ret;
         
         if (!selectValidAln($basename)) {
             
@@ -242,7 +245,7 @@ while (my $motif = $motifio->read()) {
     
     unlink glob $output . $id . ".cm.*";
     
-    print "[+] Building final covariance model...\n" .
+    print "\n[+] Building final covariance model...\n" .
               "    Output from cmbuild:\n\n";
         
     $ret = `$path/cmbuild -F $output$id.cm $basename.stockholm`;
