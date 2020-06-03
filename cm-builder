@@ -7,38 +7,62 @@ use Core::Mathematics qw(:all);
 use Core::Utils;
 use Data::IO::Sequence;
 use Data::Sequence::Utils;
+use RNA::Utils;
 
 $|++;
 
 my ($help, $motiffile, $iterations, $dbfile,
-    $motifio, $motif, $dbio, $tmpdir,
-    $ret, $basename, $id, $output,
-    $haspk, $press, $keepaln, $path);
+    $motifio, $dbio, $tmpdir, $threads,
+    $output, $press, $keepaln, $path,
+    $evalue, $minbpfrac, $postollerance, $mincov,
+    $seqfile, $seq, %sequences);
 
 do {
     
     local $SIG{__WARN__} = sub { };
 
     GetOptions( "h|help"               => \$help,
+                "s|sequence-file=s"    => \$seqfile,
                 "m|motif-file=s"       => \$motiffile,
                 "d|db-file=s"          => \$dbfile,
                 "i|iterations=i"       => \$iterations,
-                "t|tmp-dir=s"          => \$tmpdir,
+                "t|pos-tollerance=s"   => \$postollerance,
+                "q|min-query-cov=s"    => \$mincov,
+                "T|tmp-dir=s"          => \$tmpdir,
                 "o|out-dir=s"          => \$output,
                 "p|press"              => \$press,
                 "k|keep-alignment"     => \$keepaln,
+                "c|cpu=i"              => \$threads,
+                "E|evalue=s"	       => \$evalue,
+                "b|min-bp-fraction=s"  => \$minbpfrac,
                 "P|path-to-infernal=s" => \$path ) or help(1);
 
 };
 
 help() if ($help);
 
+$mincov ||= 0.5;
+$postollerance ||= 0.035;
+$minbpfrac ||= 0.5;
+$threads ||= 1;
+$evalue ||= 10;
 $tmpdir ||= "/tmp/";
 $output ||= "./";
 $tmpdir =~ s/\/?$/\//;
 $output =~ s/\/?$/\//;
 $iterations ||= 3;
 
+die "\n[!] Error: Number of CPUs must be >= 1\n\n" if (!ispositive($threads));
+die "\n[!] Error: E-value must be >= 0\n\n" if (!isnumeric($evalue) ||
+                                                !ispositive($evalue));
+die "\n[!] Error: Number of iterations must be >= 1\n\n" if (!ispositive($iterations));
+die "\n[!] Error: Minimum base-pair fraction must be comprised between 0 and 1\n\n" if (!isnumeric($minbpfrac) ||
+                                                                                        !inrange($minbpfrac, [0, 1]));
+die "\n[!] Error: Minimum query coverage must be comprised between 0 and 1\n\n" if (!isnumeric($mincov) ||
+                                                                                    !inrange($mincov, [0, 1]));
+die "\n[!] Error: Position tollerance must be comprised between 0 and 1\n\n" if (!isnumeric($postollerance) ||
+                                                                                 !inrange($postollerance, [0, 1]));
+die "\n[!] Error: Sequence file does not exist\n\n" if (!-e $seqfile);
 die "\n[!] Error: Motif file does not exist\n\n" if (!-e $motiffile);
 die "\n[!] Error: DB file does not exist\n\n" if (!-e $dbfile);
 
@@ -62,269 +86,194 @@ else {
     
 }
 
-$motifio = Data::IO::Sequence->new( file        => $motiffile,
-                                    pseudoknots => 1 );
+mkdir($output) if (!-e $output);
+mkdir($tmpdir) if (!-e $tmpdir);
+
+die "\n[!] Error: Provided output path does not point to a folder\n\n" if (!-d $output);
+die "\n[!] Error: Provided temporary path does not point to a folder\n\n" if (!-d $tmpdir);
+
+$motifio = Data::IO::Sequence->new(file => $motiffile);
 $dbio = Data::IO::Sequence->new(file => $dbfile);
+$seq = Data::IO::Sequence->new(file => $seqfile)->read();
 
-while($dbio->read()) { } # Runtime build index
+die "\n[!] Error: Unable to read sequence file\n\n" if (!defined $seq);
 
-print "\n[+] Generating initial Stockholm motif file...\n";
+print "\n[+] Importing sequence database...";
 
-if ($motif = $motifio->read()) { $haspk = fasta2stockholm($motif); }
-else { die "\n[!] Error: Unable to read motif from file\n\n"; }
+while(my $entry = $dbio->read()) { $sequences{$entry->id()} = $entry->sequence(); } # Runtime build index
 
-$id = $motif->id();
-$basename = $tmpdir . $id;
+print " " . (keys %sequences) . " imported.";
 
-foreach my $iter (1 .. $iterations) {
+die "\n\n[!] Error: Sequence database is empty\n\n" if (!keys %sequences);
+
+print "\n[+] Generating initial Stockholm motif file...";
+
+MOTIF:
+while (my $motif = $motifio->read()) {
     
-    my (%matches, %seen);
-
-    print "[+] Building covariance model (iteration " . $iter . ")...\n" .
-          "    Output from cmbuild:\n\n";
+    my ($haspk, $id, $basename, $ret,
+        $motiflen, $mstart, $mend);
+    $haspk = fasta2stockholm($motif);
     
-    $ret = `$path/cmbuild -F $basename.cm $basename.stockholm`;
-    $ret =~ s/^/    /gm;
-    print $ret;
+    $id = $motif->id();
+    $basename = $tmpdir . $id;
+    $motiflen = $motif->length();    
+    $mstart = index(rna2dna($seq->sequence), rna2dna($motif->sequence), 0);
+    $mend = $mstart + $motif->length() - 1;
     
-    if ($haspk) {
+    print "\n[+] Looking for motif position in sequence...";
+    
+    if ($mstart == -1) {
         
-        print "\n[+] Building pseudoknot covariance model (iteration " . $iter . ")...\n" .
+        print " not found.";
+        print STDERR "\n\n[!] Error: Cannot find motif $id in sequence file. Skipping...\n";
+            
+        next MOTIF;
+        
+    }
+    else { print " found at " . $mstart . "-" . $mend . "."; }
+
+    foreach my $iter (1 .. $iterations) {
+        
+        my (%matches, %seen);
+	
+        #$evalue = 10 if ($iter == $iterations);
+    
+        print "\n[+] Building covariance model (iteration " . $iter . ")...\n" .
               "    Output from cmbuild:\n\n";
-          
-        $ret = `$path/cmbuild -F $basename.pk.cm $basename.pk.stockholm`;
+        
+        $ret = `$path/cmbuild -F $basename.cm $basename.stockholm`;
         $ret =~ s/^/    /gm;
         print $ret;
         
-    }
-    
-    print "\n[+] Calibrating covariance model (may take a while)...\n" .
-          "    Output from cmcalibrate:\n\n";
-    
-    $ret = `$path/cmcalibrate $basename.cm`;
-    $ret =~ s/^/    /gm;
-    print $ret;
-    
-    if ($haspk) {
-        
-        print "\n[+] Calibrating pseudoknot covariance model (may take a while)...\n" .
+        print "\n[+] Calibrating covariance model (may take a while)...\n" .
               "    Output from cmcalibrate:\n\n";
-    
-        $ret = `$path/cmcalibrate $basename.pk.cm`;
+        
+        $ret = `$path/cmcalibrate --cpu $threads $basename.cm`;
         $ret =~ s/^/    /gm;
         print $ret;
         
-    }
-    
-    print "\n[+] Searching DB with covariance model...";
-          
-    $ret = `$path/cmsearch --mid $basename.cm $dbfile`;
-    
-    for (split(/\n>>/, $ret)) {
-        
-        next if ($_ =~ m/Hit alignments/);
-        
-        my ($refid, $start, $end, @entry);
-        @entry = split(/\n/, $_);
-        
-        for(my $i = 0; $i < @entry; $i++) {
-            
-            if ($entry[$i] =~ m/$id\s+\d+\s+\S+\s+\d+/i) {
-             
-                my ($mid, $mstart, $mend) = $entry[$i+2] =~ m/(\S+)\s+(\d+)\s+\S+\s+(\d+)/i;
-                $refid = $mid;
-                
-                $start = $mstart if (!defined $start);
-                $end = $mend;
-                
-            }
-            
-        }
-        
-        next if ($start > $end); # Avoid reverse-complemented matches
-        
-        $start--;
-        $end--;
-        $matches{$refid} = [$start, $end];
-        
-    }
-    
-    if ($haspk) {
-        
-        print "\n[+] Re-searching DB with pseudoknot covariance model...";
+        print "\n[+] Searching DB with covariance model...";
               
-        $ret = `$path/cmsearch --mid $basename.pk.cm $dbfile`;
+        $ret = `$path/cmsearch --noali --tblout $basename.out --toponly --nohmmonly -E $evalue --incE $evalue --cpu $threads $basename.cm $dbfile`;
         
-        for (split(/\n>>/, $ret)) {
+        open(my $fh, "<", "$basename.out") or die "\n\n[!] Error: failed to open cmsearch output ($!)\n\n";
+        while(<$fh>) {
             
-            next if ($_ =~ m/Hit alignments/);
+            chomp();
             
-            my ($refid, $start, $end, @entry);
-            @entry = split(/\n/, $_);
+            $_ =~ s/\s+/ /g;
             
-            for(my $i = 0; $i < @entry; $i++) {
-                
-                if ($entry[$i] =~ m/$id\s+\d+\s+\S+\s+\d+/i) {
-                 
-                    my ($mid, $mstart, $mend) = $entry[$i+2] =~ m/(\S+)\s+(\d+)\s+\S+\s+(\d+)/i;
-                    $refid = $mid;
-                    
-                    $start = $mstart if (!defined $start);
-                    $end = $mend;
-                    
-                }
-                
-            }
+            next if ($_ =~ m/^#/);
+            next if ($_ !~ m/!/);
             
-            next if ($start > $end); # Avoid reverse-complemented matches
+            my @row = split(" ", $_);
             
+            my ($refid, $queryfrom, $queryto, $start, $end) = ($row[0], @row[5..8]);
             $start--;
             $end--;
             
-            $matches{$refid} = exists $matches{$refid} ? [@{$matches{$refid}}, $start, $end] : [$start, $end];
+            next if (($queryto - $queryfrom + 1) / ($mend - $mstart + 1) < $mincov);
+            next if (!intersect([($mstart / $seq->length()) - $postollerance, ($mend / $seq->length()) + $postollerance],
+                                [($start / (length($sequences{$refid}) - 1)), ($end / (length($sequences{$refid}) - 1))]));
+            
+            $matches{$refid} = [$start, $end] if (!exists $matches{$refid});
+            
+        }
+        close($fh);
+        
+        unlink($basename . ".out");
+        
+        $matches{$_} = substr($sequences{$_}, $matches{$_}->[0], $matches{$_}->[1] - $matches{$_}->[0] + 1) for (keys %matches);
+        
+        print " " . keys(%matches) . " matches found.";
+        
+        if (!keys %matches) {
+            
+            print STDERR "\n\n[!] Error: No sequences left for motif $id. Skipping...\n";
+            
+            next MOTIF;
+            
+        }
+    
+        print "\n[+] Removing duplicate sequences...";
+        
+        foreach my $refid (keys %matches) {
+            
+            delete($matches{$refid}) if (exists $seen{$matches{$refid}});
+            
+            $seen{$matches{$refid}} = 1;
             
         }
         
-        for (keys %matches) {
-            
-            if (@{$matches{$_}} != 4) {
-                
-                delete($matches{$_});
-                
-                next;
-                
-            }
+        print " " . keys(%matches) . " matches left.";
         
-            if (intersect([@{$matches{$_}}[0,1]], [@{$matches{$_}}[2,3]])) { $matches{$_} = [ min(@{$matches{$_}}[0,2]), max(@{$matches{$_}}[1,3]) ]; }
-            else { delete($matches{$_}); }
+        if (!keys %matches) {
+            
+            print STDERR "\n\n[!] Error: No sequences left for motif $id. Skipping...\n";
+            
+            next MOTIF;
             
         }
         
-    }
-    
-    $matches{$_} = substr($dbio->read($_)->sequence(), $matches{$_}->[0], $matches{$_}->[1] - $matches{$_}->[0] + 1) for (keys %matches);
-    
-    print " " . keys(%matches) . " matches found.";
-    
-    die "\n\n[!] Error: No matches for motif. Something went wrong...\n\n" unless(keys %matches);
-    
-    #if ($nodup) {
-    #    
-    #    print "\n[+] Removing duplicate sequences...";
-    #    
-    #    foreach my $refid (keys %matches) {
-    #        
-    #        delete($matches{$refid}) if (exists $seen{$matches{$refid}});
-    #        
-    #        $seen{$matches{$refid}} = 1;
-    #        
-    #    }
-    #    
-    #    print " " . keys(%matches) . " matches left.";
-    #    
-    #    die "\n\n[!] Error: No matches for motif. Something went wrong...\n\n" unless(keys %matches);
-    #    
-    #}
-    
-    print "\n[+] Writing matches to FASTA file";
-    
-    open(my $wh, ">", $basename . ".fasta") or die "\n[!] Error: Unable to write sequences to FASTA file ($!)\n\n";
-    print $wh ">" . $_ . "\n" . $matches{$_} . "\n" for (keys %matches);
-    close($wh);
-    
-    print "\n[+] Aligning matches to covariance model...\n" .
-          "    Output from cmalign:\n\n";
-    
-    unlink($basename . ".stockholm");
-    $ret = `$path/cmalign --noprob -o $basename.stockholm $basename.cm $basename.fasta`;
-    $ret =~ s/^/    /gm;
-    print $ret . "\n";
-    
-    if ($haspk) {
+        print "\n[+] Writing matches to FASTA file";
         
-        print "\n[+] Aligning matches to pseudoknot covariance model...\n" .
+        open(my $wh, ">", $basename . ".fasta") or die "\n\n[!] Error: Unable to write sequences to FASTA file ($!)\n\n";
+        print $wh ">" . $_ . "\n" . $matches{$_} . "\n" for (keys %matches);
+        close($wh);
+        
+        print "\n[+] Aligning matches to covariance model...\n" .
               "    Output from cmalign:\n\n";
         
-        unlink($basename . ".pk.stockholm");
-        $ret = `$path/cmalign --noprob -o $basename.pk.stockholm $basename.pk.cm $basename.fasta`;
+        unlink($basename . ".stockholm");
+        $ret = `$path/cmalign --cpu $threads --noprob -o $basename.stockholm $basename.cm $basename.fasta`;
         $ret =~ s/^/    /gm;
         print $ret . "\n";
         
+        if (!selectValidAln($basename)) {
+            
+            print STDERR "\n\n[!] Error: No sequences left for motif $id in alignment. Skipping...\n\n";
+            
+            next MOTIF;
+            
+        }
+    
     }
-
-}
-
-unlink glob $output . $id . ".cm.*";
-unlink glob $output . $id . ".pk.cm.*" if ($haspk);
-
-print "[+] Building final covariance model...\n" .
-          "    Output from cmbuild:\n\n";
     
-$ret = `$path/cmbuild -F $output$id.cm $basename.stockholm`;
-$ret =~ s/^/    /gm;
-print $ret;
-
-if ($haspk) {
+    unlink glob $output . $id . ".cm.*";
     
-    print "\n[+] Building final pseudoknot covariance model...\n" .
+    print "[+] Building final covariance model...\n" .
               "    Output from cmbuild:\n\n";
         
-    $ret = `$path/cmbuild -F $output$id.pk.cm $basename.pk.stockholm`;
+    $ret = `$path/cmbuild -F $output$id.cm $basename.stockholm`;
     $ret =~ s/^/    /gm;
     print $ret;
     
-}
-
-print "\n[+] Calibrating final covariance model (may take a while)...\n" .
-          "    Output from cmcalibrate:\n\n";
-    
-$ret = `$path/cmcalibrate $output$id.cm`;
-$ret =~ s/^/    /gm;
-print $ret;
-
-if ($haspk) {
-    
-    print "\n[+] Calibrating final pseudoknot covariance model (may take a while)...\n" .
-          "    Output from cmcalibrate:\n\n";
-
-    $ret = `$path/cmcalibrate $output$id.pk.cm`;
-    $ret =~ s/^/    /gm;
-    print $ret;
-    
-}
-
-if ($keepaln) {
-    
-    system("cp " . $basename . ".stockholm .");
-    system("cp " . $basename . ".pk.stockholm .") if ($haspk);
-    
-}
-
-if ($press) {
-
-    print "\n[+] Pressing covariance model...\n" .
-              "    Output from cmpress:\n\n";
+    print "\n[+] Calibrating final covariance model (may take a while)...\n" .
+              "    Output from cmcalibrate:\n\n";
         
-    $ret = `$path/cmpress -F $output$id.cm`;
+    $ret = `$path/cmcalibrate --cpu $threads $output$id.cm`;
     $ret =~ s/^/    /gm;
     print $ret;
     
-    if ($haspk) {
-            
-        print "\n[+] Pressing pseudoknot covariance model...\n" .
+    system("cp " . $basename . ".stockholm $output") if ($keepaln);
+    
+    if ($press) {
+    
+        print "\n[+] Pressing covariance model...\n" .
                   "    Output from cmpress:\n\n";
             
-        $ret = `$path/cmpress -F $output$id.pk.cm`;
+        $ret = `$path/cmpress -F $output$id.cm`;
         $ret =~ s/^/    /gm;
         print $ret;
         
     }
     
+    print "\n[+] Cleaning up...";
+    
+    unlink glob $basename . ".*";
+    
 }
-
-print "\n[+] Cleaning up...";
-
-unlink glob $basename . ".*";
 
 print "\n[+] All done.\n\n";
 
@@ -380,6 +329,74 @@ sub fasta2stockholm {
     
 }
 
+sub selectValidAln {
+    
+    my $basename = shift;
+    
+    my ($stockstruct, $maxlen, %stock);
+    $maxlen = 0;
+    
+    open(my $sh, "<", $basename . ".stockholm") or die "\n[!] Error: Unable to open alignment file ($!)\n\n";
+    while (<$sh>) {
+    
+        chomp();
+        
+        if ($_ =~ m/^#/ && $_ !~ m/^#=GC/) { next; }
+        elsif ($_ =~ m/^(\/\/|\s*)$/) { next; }
+        else {
+    
+            $_ =~ s/\s+/ /;
+            my @l = split " ";
+            if ($l[0] !~ m/^\#/) { $stock{$l[0]} .= $l[1]; }
+            else { $stock{$l[0] . " " . $l[1]} .= $l[2]; }
+    
+        }
+    
+    
+    }
+    close($sh);
+    
+    $stockstruct = $stock{"#=GC SS_cons"};
+    $stockstruct =~ s/[^\(\)<>\[\]\{\}]/./g;
+    $stockstruct =~ tr/<>[]{}/()()()/;
+    my @stockpairs = listpairs($stockstruct);
+    
+    foreach my $id (keys %stock) {
+    
+        $maxlen = max($maxlen, length($id));
+    
+        next if ($id =~ m/^#/);
+    
+        my $stockseq = uc($stock{$id});
+        $stockseq =~ s/[^ACGUN]/-/g;
+        
+        my ($canonical, $noncanonical) = rmnoncanonical($stockseq, $stockstruct);
+        
+        delete($stock{$id}) if (scalar(@{$canonical}) / scalar(@stockpairs) < $minbpfrac);
+        
+    }
+    
+    if (keys(%stock) > 3) { #more than just the sequence itself and the structure
+        
+        open(my $sh, ">", $basename . ".stockholm") or die "\n[!] Error: Unable to overwrite alignment file ($!)\n\n";
+        print $sh "# STOCKHOLM 1.0\n" .
+                  "#=GF AU Infernal 1.1.3\n\n";
+        
+        for (keys %stock) { print $sh $_ . (" " x ($maxlen + 10 - length($_))) . $stock{$_} . "\n" if ($_ !~ m/^#/); }
+        
+        print $sh "#=GC SS_cons" . (" " x ($maxlen + 10 - length("#=GC SS_cons"))) . $stock{"#=GC SS_cons"} . "\n";
+        print $sh "#=GC RF" . (" " x ($maxlen + 10 - length("#=GC RF"))) . $stock{"#=GC RF"} . "\n";
+        print $sh "//\n";
+        close($sh);
+        
+        return(1);
+        
+    }
+    
+    return;
+
+}
+
 sub help {
     
     print "\n  [!] Error: Invalid option. Please check the help\n" if ($_[0]);
@@ -396,11 +413,17 @@ sub help {
  Options                                         Description
  -m  or --motif-file        <string>             Path to the RNA structure motif's file (in Vienna format)
  -d  or --db-file           <string>             Path to the DB file of potentially related sequences (in FASTA format)
+ -s  or --sequence-file     <string>             Path to the original sequence file (from which the motif has been extracted, in FASTA format)
+ -b  or --min-bp-fraction   <float>              Fraction of base-pairs that should be present in each sequence to retain it (Default: 0.5 [50%])
+ -q  or --min-query-cov     <float>              Minimum query motif coverage (in case of truncated motifs) (Default: 0.5 [50%])
+ -t  or --pos-tollerance    <float>              Maximum tollerance for shift in position of the motif (Default: 0.035 [3.5%])
+ -E  or --evalue            <float>              Threshold E-value for including a match (Default: 10)
  -i  or --iterations        <int>                Number of iterations to perform to refine the covariance model (Default: 3)
  -p  or --press                                  Presses covariance model (for searching with cmscan)
  -k  or --keep-alignment                         Keeps the final Stockholm alignment (for downstream analysis with R-scape)
  -P  or --path-to-infernal  <string>             Path to Infernal executables (Default: assumes all executables are in PATH)
- -t  or --tmp-dir           <string>             Path to a temporary folder (Default: /tmp)
+ -c  or --cpu               <int>                Number of processors to use for Infernal processes (Default: 1)
+ -T  or --tmp-dir           <string>             Path to a temporary folder (Default: /tmp)
  -o  or --out-dir           <string>             Path to the output directory (Default: ./)
 
  
