@@ -15,7 +15,8 @@ my ($help, $motiffile, $iterations, $dbfile,
     $motifio, $dbio, $tmpdir, $threads,
     $output, $press, $keepaln, $path,
     $evalue, $minbpfrac, $postollerance, $mincov,
-    $seqfile, $seq, $minlen, %sequences);
+    $seqfile, $seq, $minlen, $rscape, $onlyStockholm,
+    $stopIfFirstZero, $rscapeEvalue, $skipRscape, %sequences);
 
 do {
 
@@ -36,7 +37,12 @@ do {
                 "E|evalue=s"	       => \$evalue,
                 "b|min-bp-fraction=s"  => \$minbpfrac,
                 "l|min-len=i"          => \$minlen,
-                "P|path-to-infernal=s" => \$path ) or help(1);
+		        "f|stop-if-first-zero" => \$stopIfFirstZero,
+                "P|path-to-infernal=s" => \$path,
+                "R|path-to-rscape=s"   => \$rscape,
+		        "S|only-stockholm"     => \$onlyStockholm,
+                "r|skip-rscape"        => \$skipRscape,
+                "e|rscape-evalue=s"    => \$rscapeEvalue ) or help(1);
 
 };
 
@@ -47,6 +53,7 @@ $postollerance ||= 0.035;
 $minbpfrac ||= 0.5;
 $threads ||= 1;
 $evalue ||= 10;
+$rscapeEvalue ||= 0.1;
 $tmpdir ||= "/tmp/";
 $output ||= "./";
 $tmpdir =~ s/\/?$/\//;
@@ -57,6 +64,8 @@ $minlen ||= 100;
 die "\n[!] Error: Number of CPUs must be >= 1\n\n" if (!ispositive($threads));
 die "\n[!] Error: E-value must be >= 0\n\n" if (!isnumeric($evalue) ||
                                                 !ispositive($evalue));
+die "\n[!] Error: R-scape E-value must be >= 0\n\n" if (!isnumeric($rscapeEvalue) ||
+                                                        !ispositive($rscapeEvalue));
 die "\n[!] Error: Number of iterations must be >= 1\n\n" if (!ispositive($iterations));
 die "\n[!] Error: Minimum base-pair fraction must be comprised between 0 and 1\n\n" if (!isnumeric($minbpfrac) ||
                                                                                         !inrange($minbpfrac, [0, 1]));
@@ -75,7 +84,7 @@ if (defined $path) {
     die "\n[!] Error: Provided PATH to Infernal does not exist\n\n" if (!-d $path);
 
     for (qw(cmbuild cmsearch cmcalibrate
-            cmalign cmpress)) { die "\n[!] Error: " . $_ . " cannot be found in the provided path\n\n" if (!-e $path . $_); }
+            cmalign cmpress)) { die "\n[!] Error: " . $_ . " cannot be found in the provided path\n\n" if (!-e $path . $_ || !-x $path . $_ || -d $path . $_); }
 
 }
 else {
@@ -84,9 +93,17 @@ else {
     $path =~ s/[^\/]+$//;
 
     for (qw(cmbuild cmsearch cmcalibrate
-            cmalign cmpress)) { die "\n[!] Error: " . $_ . " is not in your PATH\n\n" if (!-e $path . $_); }
+            cmalign cmpress)) { die "\n[!] Error: " . $_ . " is not in your PATH\n\n" if (!-e $path . $_ || !-x $path . $_ || -d $path . $_); }
 
 }
+
+if (defined $rscape) {
+
+    die "\n[!] Error: Provided PATH to R-scape does not exist\n\n" if (!-e $rscape);
+    die "\n[!] Error: R-scape is not executable\n\n" if (-d $rscape || !-x $rscape);
+
+}
+else { $rscape = which("R-scape"); }
 
 mkdir($output) if (!-e $output);
 mkdir($tmpdir) if (!-e $tmpdir);
@@ -116,9 +133,10 @@ while (my $motif = $motifio->read()) {
 
     my ($haspk, $id, $basename, $ret,
         $motiflen, $mstart, $mend, $eta,
-        $enlarged, $seqnogaps, $structnogaps, @eta,
-	@nogaps, @mseq, @mstruct);
+        $enlarged, $seqnogaps, $structnogaps, $lastCovarying,
+        $lastIter, @eta, @nogaps, @mseq, @mstruct);
 
+    $lastCovarying = 0;
     $id = $motif->id();
     $basename = $tmpdir . $id;
     @mseq = split //, rna2dna($motif->sequence());
@@ -170,14 +188,16 @@ while (my $motif = $motifio->read()) {
 
     $haspk = fasta2stockholm($motif);
 
+    ITER:
     foreach my $iter (1 .. $iterations) {
 
-        my (%matches, %seen);
+        my ($stockname, %matches, %seen);
 
         print "\n[+] Building covariance model (iteration " . $iter . ")...\n" .
               "    Output from cmbuild:\n\n";
 
-        $ret = `$path/cmbuild -F $basename.cm $basename.stockholm`;
+        $stockname = $iter > 1 ? $basename . "_" . ($iter - 1) : $basename;
+        $ret = `$path/cmbuild -F $basename.cm $stockname.stockholm`;
         $ret =~ s/^/    /gm;
         print $ret;
 
@@ -264,12 +284,11 @@ while (my $motif = $motifio->read()) {
         print "\n[+] Aligning matches to covariance model...\n" .
               "    Output from cmalign:\n\n";
 
-        unlink($basename . ".stockholm");
-        $ret = `$path/cmalign --cpu $threads --noprob -o $basename.stockholm $basename.cm $basename.fasta`;
+        $ret = `$path/cmalign --cpu $threads --noprob -o ${basename}_$iter.stockholm $basename.cm $basename.fasta`;
         $ret =~ s/^/    /gm;
         print $ret;
 
-        if (!selectValidAln($basename)) {
+        if (!selectValidAln($basename . "_" . $iter)) {
 
             print STDERR "\n\n[!] Error: No sequences left for motif $id in alignment. Skipping...\n\n";
 
@@ -277,36 +296,57 @@ while (my $motif = $motifio->read()) {
 
         }
 
+        if (!$skipRscape) {
+
+            my $covarying = getRscapeCovarying($basename . "_" . $iter);
+
+            if (($iter > 1 && $covarying < $lastCovarying) || (($iter > 1 || ($stopIfFirstZero && $iter == 1)) && !$covarying)) {
+
+                print STDERR "\n\n[!] Note: stopping at iteration " . $iter . " [covarying: " . $covarying . " - last: " . $lastCovarying . "]\n\n";
+                last ITER;
+
+            }
+
+            $lastCovarying = $covarying;
+
+        }
+
+        $lastIter = $iter;
+
     }
 
     unlink glob $output . $id . ".cm.*";
 
-    print "\n[+] Building final covariance model...\n" .
-              "    Output from cmbuild:\n\n";
+    if (!$onlyStockholm) {
 
-    $ret = `$path/cmbuild -F $output$id.cm $basename.stockholm`;
-    $ret =~ s/^/    /gm;
-    print $ret;
+        print "\n[+] Building final covariance model...\n" .
+                  "    Output from cmbuild:\n\n";
 
-    print "\n[+] Calibrating final covariance model (may take a while)...\n" .
-              "    Output from cmcalibrate:\n\n";
-
-    $ret = `$path/cmcalibrate --cpu $threads $output$id.cm`;
-    $ret =~ s/^/    /gm;
-    print $ret;
-
-    system("cp " . $basename . ".stockholm $output") if ($keepaln);
-
-    if ($press) {
-
-        print "\n[+] Pressing covariance model...\n" .
-                  "    Output from cmpress:\n\n";
-
-        $ret = `$path/cmpress -F $output$id.cm`;
+        $ret = `$path/cmbuild -F $output$id.cm ${basename}_$lastIter.stockholm`;
         $ret =~ s/^/    /gm;
         print $ret;
 
+        print "\n[+] Calibrating final covariance model (may take a while)...\n" .
+                  "    Output from cmcalibrate:\n\n";
+
+        $ret = `$path/cmcalibrate --cpu $threads $output$id.cm`;
+        $ret =~ s/^/    /gm;
+        print $ret;
+
+        if ($press) {
+
+            print "\n[+] Pressing covariance model...\n" .
+                      "    Output from cmpress:\n\n";
+
+            $ret = `$path/cmpress -F $output$id.cm`;
+            $ret =~ s/^/    /gm;
+            print $ret;
+
+        }
+
     }
+
+    system("cp " . $basename . "_" . $lastIter . ".stockholm $output") if (($keepaln || $onlyStockholm) && $lastIter);
 
     print "\n[+] Cleaning up...";
 
@@ -442,6 +482,23 @@ sub selectValidAln {
 
 }
 
+sub getRscapeCovarying {
+
+    my $basename = shift;
+
+    print "\n[+] Calculating covarying base-pairs...\n" .
+          "    Output from R-scape:\n\n";
+
+    my ($ret, $cov);
+    $ret = `$rscape -s -E $rscapeEvalue --outdir $tmpdir $basename.stockholm`;
+    ($cov) = $ret =~ m/BPAIRS observed to covary (\d+)/;
+
+    print $ret;
+
+    return($cov);
+
+}
+
 sub help {
 
     print "\n  [!] Error: Invalid option. Please check the help\n" if ($_[0]);
@@ -465,10 +522,16 @@ sub help {
  -l  or --min-len           <int>                If the provided motif is shorter than this length, it is first extended up to this length before
                                                  performing the search, to maximize the chances of finding matches (Default: 100)
  -E  or --evalue            <float>              Threshold E-value for including a match (Default: 10)
+ -e  or --rscape-evalue     <float>              Threshold E-value for considering a base-pair to significantly covary (Default: 0.1)
  -i  or --iterations        <int>                Number of iterations to perform to refine the covariance model (Default: 3)
+ -f  or --stop-if-first-zero                     If at the first iteration 0 covarying base-pairs are found, it stops immediately instead of going
+						                         to the next iteration
+ -r  or --skip-rscape                            Skips alignment evaluation step with R-scape
  -p  or --press                                  Presses covariance model (for searching with cmscan)
+ -S  or --only-stockholm                         Does not generate final covariance model, only Stockholm alignment (implies -k)
  -k  or --keep-alignment                         Keeps the final Stockholm alignment (for downstream analysis with R-scape)
  -P  or --path-to-infernal  <string>             Path to Infernal executables (Default: assumes all executables are in PATH)
+ -R  or --path-to-rscape    <string>             Path to R-scape executable (Default: assumes R-scape is in PATH)
  -c  or --cpu               <int>                Number of processors to use for Infernal processes (Default: 1)
  -T  or --tmp-dir           <string>             Path to a temporary folder (Default: /tmp)
  -o  or --out-dir           <string>             Path to the output directory (Default: ./)
