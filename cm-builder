@@ -16,33 +16,35 @@ my ($help, $motiffile, $iterations, $dbfile,
     $output, $press, $keepaln, $path,
     $evalue, $minbpfrac, $postollerance, $mincov,
     $seqfile, $seq, $minlen, $rscape, $onlyStockholm,
-    $stopIfFirstZero, $rscapeEvalue, $skipRscape, %sequences);
+    $stopIfFirstZero, $rscapeEvalue, $skipRscape, $useHelixAggregatedEvalue,
+    %sequences);
 
 do {
 
     local $SIG{__WARN__} = sub { };
 
-    GetOptions( "h|help"               => \$help,
-                "s|sequence-file=s"    => \$seqfile,
-                "m|motif-file=s"       => \$motiffile,
-                "d|db-file=s"          => \$dbfile,
-                "i|iterations=i"       => \$iterations,
-                "t|pos-tollerance=s"   => \$postollerance,
-                "q|min-query-cov=s"    => \$mincov,
-                "T|tmp-dir=s"          => \$tmpdir,
-                "o|out-dir=s"          => \$output,
-                "p|press"              => \$press,
-                "k|keep-alignment"     => \$keepaln,
-                "c|cpu=i"              => \$threads,
-                "E|evalue=s"	       => \$evalue,
-                "b|min-bp-fraction=s"  => \$minbpfrac,
-                "l|min-len=i"          => \$minlen,
-		        "f|stop-if-first-zero" => \$stopIfFirstZero,
-                "P|path-to-infernal=s" => \$path,
-                "R|path-to-rscape=s"   => \$rscape,
-		        "S|only-stockholm"     => \$onlyStockholm,
-                "r|skip-rscape"        => \$skipRscape,
-                "e|rscape-evalue=s"    => \$rscapeEvalue ) or help(1);
+    GetOptions( "h|help"                        => \$help,
+                "s|sequence-file=s"             => \$seqfile,
+                "m|motif-file=s"                => \$motiffile,
+                "d|db-file=s"                   => \$dbfile,
+                "i|iterations=i"                => \$iterations,
+                "t|pos-tollerance=s"            => \$postollerance,
+                "q|min-query-cov=s"             => \$mincov,
+                "T|tmp-dir=s"                   => \$tmpdir,
+                "o|out-dir=s"                   => \$output,
+                "p|press"                       => \$press,
+                "k|keep-alignment"              => \$keepaln,
+                "c|cpu=i"                       => \$threads,
+                "E|evalue=s"	                => \$evalue,
+                "b|min-bp-fraction=s"           => \$minbpfrac,
+                "l|min-len=i"                   => \$minlen,
+		        "f|stop-if-first-zero"          => \$stopIfFirstZero,
+                "P|path-to-infernal=s"          => \$path,
+                "R|path-to-rscape=s"            => \$rscape,
+		        "S|only-stockholm"              => \$onlyStockholm,
+                "r|skip-rscape"                 => \$skipRscape,
+                "e|rscape-evalue=s"             => \$rscapeEvalue,
+                "a|use-helix-aggregated-evalue" => \$useHelixAggregatedEvalue ) or help(1);
 
 };
 
@@ -490,8 +492,11 @@ sub getRscapeCovarying {
           "    Output from R-scape:\n\n";
 
     my ($ret, $cov);
-    $ret = `$rscape -s -E $rscapeEvalue --outdir $tmpdir $basename.stockholm`;
-    ($cov) = $ret =~ m/BPAIRS observed to covary (\d+)/;
+    $ret = `$rscape -s -E $rscapeEvalue --outdir $tmpdir --lancaster $basename.stockholm`;
+    $cov = 0;
+
+    if ($useHelixAggregatedEvalue) { while($ret =~ m/^# aggregated LANCASTER.+?\*/mg) { $cov++; } }
+    else { ($cov) = $ret =~ m/BPAIRS observed to covary (\d+)/; }
 
     print $ret;
 
@@ -505,36 +510,38 @@ sub help {
 
     die <<HELP;
 
- CM Build (v$Core::Utils::VERSION)
+ CM Builder (v$Core::Utils::VERSION)
 
  Author:  Danny Incarnato (dincarnato[at]rnaframework.com)
- Summary: Automatically builds and refines Infernal's RNA covariance models
+ Summary: AutomaGically builds and refines Infernal's RNA covariance models
 
- Usage:   cm-build [Options]
+ Usage:   cm-builder [Options]
 
- Options                                         Description
- -m  or --motif-file        <string>             Path to the RNA structure motif's file (in Vienna format)
- -d  or --db-file           <string>             Path to the DB file of potentially related sequences (in FASTA format)
- -s  or --sequence-file     <string>             Path to the original sequence file (from which the motif has been extracted, in FASTA format)
- -b  or --min-bp-fraction   <float>              Fraction of base-pairs that should be present in each sequence to retain it (Default: 0.5 [50%])
- -q  or --min-query-cov     <float>              Minimum query motif coverage (in case of truncated motifs) (Default: 0.5 [50%])
- -t  or --pos-tollerance    <float>              Maximum tollerance for shift in position of the motif (Default: 0.035 [3.5%])
- -l  or --min-len           <int>                If the provided motif is shorter than this length, it is first extended up to this length before
-                                                 performing the search, to maximize the chances of finding matches (Default: 100)
- -E  or --evalue            <float>              Threshold E-value for including a match (Default: 10)
- -e  or --rscape-evalue     <float>              Threshold E-value for considering a base-pair to significantly covary (Default: 0.1)
- -i  or --iterations        <int>                Number of iterations to perform to refine the covariance model (Default: 3)
- -f  or --stop-if-first-zero                     If at the first iteration 0 covarying base-pairs are found, it stops immediately instead of going
-						                         to the next iteration
- -r  or --skip-rscape                            Skips alignment evaluation step with R-scape
- -p  or --press                                  Presses covariance model (for searching with cmscan)
- -S  or --only-stockholm                         Does not generate final covariance model, only Stockholm alignment (implies -k)
- -k  or --keep-alignment                         Keeps the final Stockholm alignment (for downstream analysis with R-scape)
- -P  or --path-to-infernal  <string>             Path to Infernal executables (Default: assumes all executables are in PATH)
- -R  or --path-to-rscape    <string>             Path to R-scape executable (Default: assumes R-scape is in PATH)
- -c  or --cpu               <int>                Number of processors to use for Infernal processes (Default: 1)
- -T  or --tmp-dir           <string>             Path to a temporary folder (Default: /tmp)
- -o  or --out-dir           <string>             Path to the output directory (Default: ./)
+ Options                                             Description
+ -m  or --motif-file                    <string>     Path to the RNA structure motif's file (in Vienna format)
+ -d  or --db-file                       <string>     Path to the DB file of potentially related sequences (in FASTA format)
+ -s  or --sequence-file                 <string>     Path to the original sequence file (from which the motif has been extracted, in FASTA format)
+ -b  or --min-bp-fraction               <float>      Fraction of base-pairs that should be present in each sequence to retain it (Default: 0.5 [50%])
+ -q  or --min-query-cov                 <float>      Minimum query motif coverage (in case of truncated motifs) (Default: 0.5 [50%])
+ -t  or --pos-tollerance                <float>      Maximum tollerance for shift in position of the motif (Default: 0.035 [3.5%])
+ -l  or --min-len                       <int>        If the provided motif is shorter than this length, it is first extended up to this length before
+                                                     performing the search, to maximize the chances of finding matches (Default: 100)
+ -E  or --evalue                        <float>      Threshold E-value for including a match (Default: 10)
+ -e  or --rscape-evalue                 <float>      Threshold E-value for considering a base-pair to significantly covary (Default: 0.1)
+ -a  or --use-helix-aggregated-evalue                At each iteration, the number of significantly covarying helices is evaluated instead of the number 
+                                                     of significantly covarying base-pairs (requires R-scape v2.0.0.q)
+ -i  or --iterations                    <int>        Number of iterations to perform to refine the covariance model (Default: 3)
+ -f  or --stop-if-first-zero                         If at the first iteration 0 covarying base-pairs are found, it stops immediately instead of going
+						                             to the next iteration
+ -r  or --skip-rscape                                Skips alignment evaluation step with R-scape
+ -p  or --press                                      Presses covariance model (for searching with cmscan)
+ -S  or --only-stockholm                             Does not generate final covariance model, only Stockholm alignment (implies -k)
+ -k  or --keep-alignment                             Keeps the final Stockholm alignment (for downstream analysis with R-scape)
+ -P  or --path-to-infernal              <string>     Path to Infernal executables (Default: assumes all executables are in PATH)
+ -R  or --path-to-rscape                <string>     Path to R-scape executable (Default: assumes R-scape is in PATH)
+ -c  or --cpu                           <int>        Number of processors to use for Infernal processes (Default: 1)
+ -T  or --tmp-dir                       <string>     Path to a temporary folder (Default: /tmp)
+ -o  or --out-dir                       <string>     Path to the output directory (Default: ./)
 
 
 HELP
