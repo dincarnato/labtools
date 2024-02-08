@@ -1,0 +1,256 @@
+#!/usr/bin/env perl
+
+use strict;
+use File::Basename;
+use Getopt::Long qw(:config no_ignore_case);
+use List::Util;
+
+use Core::Mathematics qw(:all);
+use RF::Data::IO::MM;
+
+$|++;
+
+my ($medianCov, $in, $out, $input,
+    $output, $overwrite, $onlyAC, $minMutPerRead,
+    $minReadLen, $randSubsample, $bedAnno, $whitelist,
+    $help, %bedAnno, %whitelist);
+
+do {
+
+    local $SIG{__WARN__} = sub { };
+
+    GetOptions( "h|help"              => \$help,
+                "xc|medianCoverage=s" => \$medianCov,
+                "o|output=s"          => \$output,
+                "ow|overwrite"        => \$overwrite,
+                "ac|onlyAC"           => \$onlyAC,
+                "mpr|minMutPerRead=s" => \$minMutPerRead,
+                "mrl|minReadLen=s"    => \$minReadLen,
+                "rs|randSubsample=s"  => \$randSubsample,
+                "a|annotation=s"      => \$bedAnno,
+                "wl|whitelist=s"      => \$whitelist ) or help(1);
+
+    $input = $ARGV[0];
+
+};
+
+help() if ($help);
+
+$minMutPerRead //= 2; 
+
+if (!defined $output) {
+
+    $output = fileparse($input, qr/\.[^.]*/);
+    $output =~ s/\.mm$//;
+    $output .= "_filtered.mm";
+
+}
+
+die "\n[!] Error: No input MM file specified\n\n" if (!defined $input);
+die "\n[!] Error: Input MM file does not exist\n\n" if (!-e $input);
+die "\n[!] Error: BED annotation file does not exist\n\n" if (defined $bedAnno && !-e $bedAnno);
+die "\n[!] Error: Maximum coverage must be a positive INT > 0\n\n" if (defined $medianCov && (!isint($medianCov) || $medianCov <= 0));
+die "\n[!] Error: Minimum number of mutations per read must be a positive INT > 0\n\n" if (!isint($minMutPerRead) || $minMutPerRead <= 0);
+die "\n[!] Error: Minimum read length must be a positive INT > 0\n\n" if (defined $minReadLen && (!isint($minReadLen) || $minReadLen <= 0));
+die "\n[!] Error: Random subsample positive INT > 1\n\n" if (defined $randSubsample && (!isint($randSubsample) || $randSubsample <= 1));
+die "\n[!] Error: Output file already exists. Please specify -ow to overwrite\n\n" if (-e $output && !$overwrite);
+
+if (defined $whitelist) {
+
+    print "\n[+] Importing whitelist...";
+
+    die "\n\n[!] Error: Whitelist file does not exist\n\n" if (!-e $whitelist);
+
+    open(my $wh, "<", $whitelist) or die "\n\n[!] Error: Unable to read from whitelist file (" . $! . ")\n\n";
+    while(<$wh>) {
+
+        chomp();
+        $whitelist{$_} = 1;
+
+    }
+    close($wh);
+
+    print " " . scalar(keys %whitelist) . " transcripts imported.";
+
+    die "\n\n[!] Error: Empty whitelist file\n\n" if (!keys %whitelist);
+
+}
+
+if ($bedAnno) {
+
+    print "\n[+] Importing BED annotation...";
+
+    open(my $fh, "<", $bedAnno) or die "\n\n[!] Error: Unable to read BED annotation (" . $! . ")\n\n";
+    while(<$fh>) {
+
+        chomp();
+        my ($id, @row);
+        @row = split /\t/;
+
+        next if (@row < 3);
+        next if (!isint($row[1]) || !ispositive($row[1]));
+        next if (!isint($row[2]) || !ispositive($row[2]));
+
+        die "\n\n[!] Error: Duplicate entry ID \"" . $row[0] . "\"\n\n" if (exists $bedAnno{$row[0]});
+
+        $bedAnno{$row[0]} = { start => $row[1],
+                              end   => $row[2] };
+
+    }
+    close($fh);
+
+    print " " . scalar(keys %bedAnno) . " regions imported.";
+
+    die "\n\n[!] Error: Empty BED annotation file\n\n" if (!keys %bedAnno);
+
+}
+
+print "\n[+] Opening MM file IO...";
+
+$in = RF::Data::IO::MM->new( file => $input,
+                             mode => "r" );
+$out = RF::Data::IO::MM->new( file      => $output,
+                              mode      => "w",
+                              overwrite => $overwrite );
+
+print "\n[+] Filtering reads (please wait, may take some time)...";
+
+while(my ($id, $realSeq, $reads) = $in->read()) {
+
+    next if (defined $whitelist && !exists $whitelist{$id});
+
+    my ($start, $end, $len, $seq,
+        @reads);
+    $len = length($realSeq);
+
+    if ($bedAnno) {
+
+        next if (!exists $bedAnno{$id});
+
+        $start = $bedAnno{$id}->{start};
+        $end = $bedAnno{$id}->{end};
+
+        if ($end > $len) {
+
+            warn "\n[!] Warning: End coordinate exceeds length for transcript \"" . $id . "\" (end: " . $end . "; length: " . $len . ")";
+
+            next;
+
+        }
+
+        $len = $end - $start;
+        $seq = substr($realSeq, $start, $len);
+
+    }
+    else {
+
+        $start = 0;
+        $end = $len;
+        $seq = $realSeq;
+
+    }
+
+    $out->append_transcript($id, $seq); 
+
+    for (@$reads) {
+
+        my ($readStart, $readEnd, @muts);
+        @muts = $onlyAC ? grep { substr($realSeq, $_, 1) =~ m/^[AC]$/ } @{$_->[2]} : @{$_->[2]};
+        @muts = grep { inrange($_, [$start, $end - 1]) } @muts;
+
+        next if (@muts < $minMutPerRead);
+        next if ($_->[1] < $start);
+        last if ($_->[0] >= $end);
+
+        $readStart = max($_->[0], $start) - $start;
+        $readEnd = min($_->[1], $end - 1) - $start;
+
+        next if ($minReadLen && $readEnd - $readStart + 1 < $minReadLen);
+
+        @muts = map { $_ - $start } @muts;
+        push(@reads, [ $readStart, $readEnd, \@muts ]);
+
+    }
+
+    @reads = List::Util::shuffle(@reads);
+    @reads = @reads[0 .. round($#reads / $randSubsample)] if ($randSubsample);
+    @reads = sort { $a->[0] <=> $b->[0] } @reads;
+
+    if (@reads) {
+
+        my ($medianLen, $readsToMaxCov, $lastStart, $count);
+
+        if ($medianCov) {
+
+            $medianLen = median(map { $_->[1] - $_->[0] + 1 } @reads);
+            $readsToMaxCov = $len < $medianLen ? $medianCov : round(($len * $medianCov / $medianLen) / ($len - $medianLen + 1));
+            ($lastStart, $count) = (undef, 0);
+
+        }
+
+        for (@reads) {
+
+            if ($medianCov) {
+
+                if (!defined $lastStart || $lastStart == $_->[0]) {
+
+                    next if ($count >= $readsToMaxCov);
+
+                    $lastStart = $_->[0];
+                    $count++;
+
+                }
+                else {
+
+                    $lastStart = $_->[0];
+                    $count = 1;
+
+                }
+
+            }
+
+            $out->append_read($_->[0], $_->[1], scalar(@{$_->[2]}), $_->[2]);
+
+        }
+
+    }
+
+}
+
+print "\n[+] All done.\n\n";
+
+$in->close();
+$out->close();
+
+sub help {
+
+    print "\n  [!] Error: Invalid option. Please check the help\n" if ($_[0]);
+
+    die <<HELP;
+
+ filterMM (using RNA Framework v$Core::Utils::VERSION)
+
+ Author:  Danny Incarnato (dincarnato[at]rnaframework.com)
+ Summary: Filtering of MM files
+
+ Usage:   filterMM [Options] input.mm
+
+ Options                                   Description
+ -o   or --output             <string>     Output MM file (Default: <input>_filtered.mm)
+ -ow  or --overwrite                       Overwrites output MM file (if the specified file already exists)
+ -ac  or --onlyAC                          Only retains mutations on A/C bases
+ -mpr or --minMutPerRead      <int>        Reads with less than this number of mutations are discarded (>0, Default: 2)
+ -mrl or --minReadLen         <int>        Reads shortern than this length are discarded (>0, Default: no minimum length)
+ -xc  or --medianCoverage     <int>        Reads are randomly downsampled to achieve approximately this median coverage 
+                                           per base (>0, Default: keep all reads)
+ -rs  or --randSubsample      <int>        Randomly subsamples this fraction of reads (>1, Default: keep all reads)
+                                           Note: for example, if -rs 2, 1/2 of the reads will we subsampled
+ -a   or --annotation         <string>     Path to a list of regions (in BED format) to retain in the filtered MM
+                                           Note: only the portion of the read falling within the boundaries of the provided
+                                                 BED intervals will be retained and subjected to the various filtering
+ -wl  or --whitelist          <string>     Path to a file containing a list (one per line) of transcripts to be included
+                                           in the output MM file
+
+HELP
+
+}

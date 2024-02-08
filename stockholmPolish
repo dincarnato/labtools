@@ -1,0 +1,357 @@
+#!/usr/bin/env perl
+
+use strict;
+use File::Basename;
+use File::Path qw(mkpath);
+use Getopt::Long qw(:config no_ignore_case);
+
+use lib "/path/to/RNAFramework/lib";
+
+use Core::Mathematics qw(:all);
+use Core::Process::Queue;
+use Core::Utils;
+use Data::Sequence::Utils;
+use RNA::Utils;
+use Term::Progress;
+
+$|++;
+
+my ($outZscore, $outGap, $reportFastaUngapped, $output,
+    $input, $overwrite, $error, $help,
+    $progressBar, $queue, $processors, $fracTolerance,
+    $minBpFrac, $reportDiscarded, $keepAlnToDisc, @input);
+
+do {
+
+    local $SIG{__WARN__} = sub { };
+
+    GetOptions( "h|help"                 => \$help,
+                "p|processors=s"         => \$processors,
+                "o|outputDir=s"          => \$output,
+                "ow|overwrite"           => \$overwrite,
+                "lo|lenOutlier=s"        => \$outZscore,
+                "go|gapOutlier=s"        => \$outGap,
+                "ru|reportUngapped"      => \$reportFastaUngapped,
+                "lt|lenFracTolerance=s"  => \$fracTolerance,
+                "mb|minBpFrac=s"         => \$minBpFrac,
+                "rd|reportDiscarded"     => \$reportDiscarded,
+                "kad|keepAlnToDiscarded" => \$keepAlnToDisc ) or help(1);
+
+    $input = $ARGV[0];
+
+};
+
+help() if ($help);
+
+$processors ||= 1;
+$outZscore //= 2;
+$outGap //= 0;
+$minBpFrac //= 0;
+$fracTolerance //= 0.1;
+$output ||= "stockholmPolish_out/";
+$output =~ s/\/?$/\//;
+
+die "\n[!] Error: No input file/directory provided\n\n" if (!defined $input);
+die "\n[!] Error: Provided input file/directory does not exist\n\n" if (!-e $input);
+die "\n[!] Error: Number of processors must be a positive INT > 0\n\n" if (!ispositive($processors) || $processors < 1);
+die "\n[!] Error: Gap outlier threshold must be comprised beteen 0 and 1\n\n" if (!isnumeric($outGap) || !inrange($outGap, [0, 1]));
+die "\n[!] Error: Fractional tolerance must be comprised beteen 0 and 1\n\n" if (!isnumeric($fracTolerance) || !inrange($fracTolerance, [0, 1]));
+die "\n[!] Error: Minimum base-pair fraction must be comprised beteen 0 and 1\n\n" if (!isnumeric($minBpFrac) || !inrange($minBpFrac, [0, 1]));
+die "\n[!] Error: Length outlier threshold must be numeric\n\n" if (!isnumeric($outZscore));
+
+$outZscore = abs($outZscore);
+
+print "\n[+] Making output directory...";
+
+if (-e $output) {
+
+    if ($overwrite) {
+
+        my $error = rmtree($output);
+
+        die "\n\n[!] Error: " . $error . "\n\n" if ($error);
+
+    }
+    else { die "\n\n[!] Error: Output directory already exists." .
+               "\n    Please use -ow (or --overwrite) to overwrite output directory\n\n"; }
+
+}
+
+mkpath($output, { mode  => 0755,
+                  error => \$error });
+mkpath($output . "ungapped", { mode  => 0755,
+                               error => \$error }) if ($reportFastaUngapped);
+mkpath($output . "discarded", { mode  => 0755,
+                                error => \$error }) if ($reportDiscarded);
+
+die "\n\n[!] Error: Unable to create output directory (" . $error->[0]->{each(%{$error->[0]})} . ")\n\n" if (@{$error});
+
+print "\n[+] Importing Stockholm alignments...";
+
+if (-d $input) {
+
+    $input =~ s/\/?$/\//;
+
+    opendir(my $dh, $input) or die "\n\n[!] Error: Unable to read from input directory (" . $! . ")\n\n";
+    while(my $file = readdir($dh)) {
+
+        next if ($file !~ /\.st(?:o(?:ckholm)|k)$/);
+
+        push(@input, $input . $file);
+
+    }
+    closedir($dh);
+
+}
+else { push(@input, $input); }
+
+print " " . scalar(@input) . " imported.";
+
+die "\n\n[!] Error: No Stockholm file (*.sto, *.stockholm, *.stk) in input directory\n\n" if (!@input);
+
+print "\n[+] Polishing Stockholm alignments. Please wait...\n\n";
+
+$progressBar = Term::Progress->new( max   => scalar(@input),
+                                    width => 50 );
+$queue = Core::Process::Queue->new( processors   => $processors,
+                                    parentOnExit => sub { $progressBar->update(1); },
+                                    stderr       => $output . "errors.out",
+                                    verbosity    => -1 );
+$progressBar->init("");
+$queue->enqueue( command   => \&polishAln,
+                 arguments => [ $_ ],
+                 id        => $_ ) for (@input);
+$queue->start();
+$queue->waitall();
+
+print "\n\n[+] All done.\n\n";
+
+sub polishAln {
+
+    my $file = shift;
+
+    my ($structure, $maxIdLen, $first, $last, 
+        $meanLen, $sdLen, $baseName, @stockPairs, 
+        @pairedBases, @lengths, @j, %stock, %discarded);
+    $baseName = (fileparse($file, qr/\.st(?:o(?:ckholm)|k)$/))[0];
+    $maxIdLen = 0;
+
+    open(my $sh, "<", $file) or die "[!] Unable to open input Stockholm alignment \"" . $file . "\" (PID: $$, $!)\n";
+    while (<$sh>) {
+
+        chomp();
+
+        if (/^#/ && $_ !~ m/^#=GC/) { next; }
+        elsif (/^(\/\/|\s*)$/) { next; }
+        else {
+
+            $_ =~ s/\s+/ /;
+            my @l = split " ";
+            if ($l[0] !~ m/^\#/) { $stock{$l[0]} .= $l[1]; }
+            else { $stock{$l[0] . " " . $l[1]} .= $l[2]; }
+
+        }
+
+
+    }
+    close($sh);
+
+    die "[!] #=GC SS_cons line is missing in Stockholm file \"" . $file . "\" (PID: $$)\n" if (!exists $stock{"#=GC SS_cons"});
+
+    $structure = $stock{"#=GC SS_cons"};
+    $structure =~ s/[^\(\)<>\[\]\{\}]/./g;
+    $structure =~ tr/<>[]{}/()()()/;
+    @stockPairs = listpairs($structure);
+    @pairedBases = map { @{$_} } @stockPairs;
+    ($first, $last) = (min(@pairedBases), max(@pairedBases));
+
+    foreach my $id (keys %stock) {
+
+        next if ($id =~ m/^#/);
+
+        my ($stockSeq, $canonicalBp);
+        $stockSeq = $stock{$id};
+        $stockSeq =~ s/[^ACGTUN]/-/ig;
+        $canonicalBp = (rmnoncanonical($stockSeq, $structure))[0];
+
+        if (@$canonicalBp / @stockPairs < $minBpFrac) {
+
+            $discarded{$id} = $stock{$id} if ($reportDiscarded);
+            delete($stock{$id});
+
+            next;
+
+        }
+
+        $stockSeq =~ s/-//g;
+        push(@lengths, [$id, length($stockSeq)]);
+
+    }
+
+    die "[!] No sequence left after polishing file \"" . $file . "\" (PID: $$)\n" if (!@lengths);
+
+    $meanLen = mean(map { $_->[1] } @lengths);
+    $sdLen = stdev(map { $_->[1] } @lengths);
+
+    if ($sdLen) {
+
+        my (@zscores, @i);
+        @zscores = map { ($_->[1] - $meanLen) / $sdLen } @lengths;
+        @i = grep { abs($zscores[$_]) > $outZscore && 1 - min($meanLen, $lengths[$_]->[1]) / max($meanLen, $lengths[$_]->[1]) > $fracTolerance } 0 .. $#zscores;
+        
+        foreach my $id (map { $_->[0] } @lengths[@i]) {
+
+            $discarded{$id} = $stock{$id} if ($reportDiscarded);
+            delete($stock{$id});
+
+        }
+
+    }
+
+    $maxIdLen = max(map { length($_) } keys %stock);
+    $maxIdLen = max($maxIdLen, map { length($_) } keys %discarded) if (defined $reportDiscarded);
+    %stock = map { $_ => $_ =~ /^#/ ? $stock{$_} : [ split(//, substr($stock{$_}, $first, $last - $first + 1)) ] } keys %stock;
+    %discarded = map { $_ => [ split(//, substr($discarded{$_}, $first, $last - $first + 1)) ] } keys %discarded if ($reportDiscarded);
+
+    for my $j (0 .. $last - $first) {
+
+        my ($total, @ungapped);
+
+        foreach my $id (keys %stock) {
+
+            next if ($id =~ /^#/);
+
+            push(@ungapped, $id) if ($stock{$id}->[$j] =~ m/^[ACGUTN]$/i);
+            $total++;
+
+        }
+
+        if ($keepAlnToDisc) {
+
+            foreach my $id (keys %discarded) {
+
+                push(@ungapped, $id) if ($discarded{$id}->[$j] =~ m/^[ACGUTN]$/i);
+                $total++;
+
+            }
+
+        }
+
+        next if (!@ungapped);
+
+        if (@ungapped / $total < $outGap) { 
+            
+            foreach my $id (@ungapped) {
+
+                $discarded{$id} = clonearrayref($stock{$id}) if ($reportDiscarded);
+                delete($stock{$id});
+
+            }
+
+            next if (!$keepAlnToDisc);
+            
+        }
+        
+        push(@j, $j);
+
+    }
+
+    for (keys %stock) {
+
+        next if (/^#/);
+
+        $stock{$_} = join("", @{$stock{$_}}[@j]);
+
+    }
+
+    if ($reportDiscarded) { $discarded{$_} = join("", $keepAlnToDisc ? @{$discarded{$_}}[@j] : @{$discarded{$_}}) for (keys %discarded); }
+
+    if (keys(%stock) >= 3) { # More than just the sequence itself and the structure
+
+        open(my $sh, ">", $output . $baseName . ".stockholm") or die "[!] Unable to write polished Stockholm file for alignment \"" . $baseName . "\" (PID: $$, $!)\n";
+        select((select($sh), $|=1)[0]);
+        print $sh "# STOCKHOLM 1.0\n" .
+                  "#=GF AU Infernal 1.1.3 (polished with stockholmPolish)\n\n";
+
+        for (keys %stock) { print $sh $_ . (" " x ($maxIdLen + 10 - length($_))) . $stock{$_} . "\n" if ($_ !~ /^#/); }
+
+        print $sh "#=GC SS_cons" . (" " x ($maxIdLen + 10 - length("#=GC SS_cons"))) . join("", (split(//, substr($stock{"#=GC SS_cons"}, $first, $last - $first + 1)))[@j]) . "\n";
+        print $sh "#=GC RF" . (" " x ($maxIdLen + 10 - length("#=GC RF"))) . join("", (split(//, substr($stock{"#=GC RF"}, $first, $last - $first + 1)))[@j]) . "\n" if (exists $stock{"#=GC RF"});
+        print $sh "//\n";
+        close($sh);
+
+        if ($reportDiscarded && keys %discarded) {
+
+            open(my $dh, ">", $output . "discarded/" . $baseName . ".stockholm") or die "[!] Unable to write discarded Stockholm file for alignment \"" . $baseName . "\" (PID: $$, $!)\n";
+            select((select($dh), $|=1)[0]);
+            print $dh "# STOCKHOLM 1.0\n" .
+                    "#=GF AU Infernal 1.1.3 (discarded by stockholmPolish)\n\n";
+            print $dh $_ . (" " x ($maxIdLen + 10 - length($_))) . $discarded{$_} . "\n" for (keys %discarded);
+            print $dh "//\n";
+            close($dh);
+
+        }
+
+        if ($reportFastaUngapped) {
+
+            open(my $fh, ">", $output . "ungapped/" . $baseName . ".fasta") or die "[!] Unable to write ungapped FASTA file for alignment \"" . $baseName . "\" (PID: $$, $!)\n";
+            select((select($fh), $|=1)[0]);
+            for (keys %stock) { 
+                
+                next if (/^#/);
+
+                $stock{$_} =~ s/[^ACGTUN]//gi;
+                print $fh ">" . $_ . "\n" . uc($stock{$_}) . "\n"; 
+                
+            }
+            close($fh);
+
+        }
+
+    }
+    else { die "[!] No sequence left after polishing file \"" . $file . "\" (PID: $$, $!)\n"; }
+
+}
+
+sub help {
+
+    print "\n  [!] Error: Invalid option. Please check the help\n" if ($_[0]);
+
+    die <<HELP;
+
+ stockholmPolish (using RNAFramework libs v$Core::Utils::VERSION)
+
+ Author:  Danny Incarnato (danny[at]laddertx.com)
+ Summary: Removes likely outlier sequences from an RNA Stockholm alignment
+
+ Usage:   stockholmPolish file.sto     # Single file
+          stockholmPolish dir/         # Entire directory
+
+ Options                                     Description
+ -p   or --processors            <int>       Number of processors to use (Default: 1)
+ -o   or --output                <string>    Output directory (Default: stockholmPolish_out/)
+ -ow  or --overwrite                         Overwrites output directory (if the specified path already exists)
+ -lo  or --lenOutlier            <float>     After calculating the distribution of lengths of the sequences in 
+                                             the alignment, and converting them into Z-scores, sequences with
+                                             abs(Z-score) > this value are discarded as outliers (Default: 2)
+                                             Note: this option is overridden by -ft (or --fracTolerance)
+ -go  or --gapOutlier            <float>     For each column of the alignment, if the fraction of sequences having
+                                             a non-gap character is < than this fraction, those sequences are
+                                             discarded as outliers (0-1, Default: 0 [no filter])
+ -lt  or --lenFracTolerance      <float>     Sequences whose length differs < this fraction from the mean of the
+                                             distribution of sequence lengths are retained even if Z-score < -lo
+                                             (0-1, Default: 0.1)                           
+ -mb  or --minBpFrac             <float>     Minimum fraction of canonical base-pairs to retain a sequence 
+                                             (0-1, Default: 0 [no filter])
+ -ru  or --reportUngapped                    In addition to the polished Stockholm alignment, ungapped sequences
+                                             will be written to a separate FASTA file
+ -rd  or --reportDiscarded                   In addition to the polished Stockholm alignment, discarded alignments
+                                             will be reported to a separate Stockholm file
+ -kad or --keepAlnToDiscarded                Only positions that are gaps in both the included and discarded sequences,
+                                             will be removed, in orded to preserve the alignment between the polished
+                                             Stockholm and the discarded Stockholm alignments
+
+HELP
+
+}
+

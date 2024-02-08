@@ -1,0 +1,152 @@
+#!/usr/bin/env perl
+
+use strict;
+use File::Path qw(mkpath);
+use Getopt::Long qw(:config no_ignore_case);
+
+use Core::Mathematics;
+use Core::Process::Queue;
+use Interface::ViennaRNA;
+use RF::Data::IO::XML;
+use Term::Progress;
+
+$|++;
+
+my ($slope, $intercept, $output, $overwrite, 
+    $help, $error, $progressBar, $queue,
+    $processors, @dirs, @files);
+
+do {
+
+    local $SIG{__WARN__} = sub { };
+
+    GetOptions( "h|help"         => \$help,
+                "sl|slope=s"     => \$slope,
+                "in|intercept=s" => \$intercept,
+                "o|output=s"     => \$output,
+                "ow|overwrite"   => \$overwrite,
+                "p|processors=s" => \$processors ) or help(1);
+
+    @dirs = @ARGV;
+
+};
+
+help() if ($help);
+
+$processors ||= 1;
+$slope ||= 1.8;
+$intercept ||= -0.6;
+$output ||= "consensusFold_out/";
+$output =~ s/\/?$/\//;
+
+die "\n  [!] Error: Number of processors must be a positive INT > 0\n\n" if (!isnumeric($processors) || !$processors);
+die "\n  [!] Error: At least 2 XML input directories needed\n\n" unless (@dirs);
+for (@dirs) { die "\n  [!] Error: Path to XML input directory \"" . $_ . "\" does not point to a folder\n\n" unless (-d $_); }
+die "\n  [!] Error: Slope must be numeric\n\n" if (!isnumeric($slope));
+die "\n  [!] Error: Intercept must be numeric\n\n" if (!isnumeric($intercept));
+
+print "\n[+] Making output directory...";
+
+if (-e $output) {
+
+    if ($overwrite) {
+
+        $error = rmtree($output);
+
+        die "\n\n  [!] Error: " . $error . "\n\n" if ($error);
+
+    }
+    else { die "\n\n  [!] Error: Output directory already exists." .
+               "\n      Please use -ow (or --overwrite) to overwrite output directory\n\n"; }
+
+}
+
+mkpath($output, { mode  => 0755,
+                  error => \$error });
+
+die "\n\n  [!] Error: Unable to create output directory (" . $error->[0]->{each(%{$error->[0]})} . ")\n\n" if (@{$error});
+
+opendir(my $dh, $dirs[0]) or die "\n\n  [!] Error: Unable to list directory \"" . $dirs[0] . "\" content\n\n";
+FILES:
+while (my $file = readdir($dh)) {
+
+    next if (substr($file, -4) ne ".xml");
+
+    for (@dirs) { next FILES if (!-e $_ . "/" . $file); }
+
+    push(@files, $file);
+
+}
+closedir($dh);
+
+print "\n[+] Folding transcripts. Please wait...\n\n";
+
+$progressBar = Term::Progress->new( max   => scalar(@files),
+                                    width => 50 );
+$queue = Core::Process::Queue->new( processors   => $processors,
+                                    parentOnExit => sub { $progressBar->update(1); },
+                                    stderr       => $output . "errors.out",
+                                    verbosity    => -1 );
+$progressBar->init("");
+$queue->enqueue( command   => \&fold,
+                 arguments => [ $_ ],
+                 id        => $_ ) for (@files);
+$queue->start();
+$queue->waitall();
+
+print "\n\n[+] All done.\n\n";
+
+sub fold {
+
+    my $file = shift;
+
+    my ($intf, $id, $struct, %reacts, 
+        %seq);
+
+    foreach my $dir (@dirs) {
+
+        my $xml = RF::Data::IO::XML->new(file => $dir . "/" . $file);
+        $id = $xml->id();
+        $dir =~ s/\///g;
+        $seq{$dir} = $xml->sequence();
+        $reacts{$dir} = [ $xml->reactivity() ];
+
+    }
+
+    $intf = Interface::ViennaRNA->new();
+    $struct = $intf->alifold( \%seq,
+                              { slope      => $slope,
+                                intercept  => $intercept,
+                                reactivity => \%reacts });
+
+    $file =~ s/\.xml$/\.db/;
+
+    open(my $fh, ">", $output . "/" . $file) or die "[!] Failed to write to \"" . $output . "/" . $file . "\" (PID: $$, $!)\n";
+    print $fh ">" . $id . "\n" . $struct->sequence() . "\n" . $struct->structure() . "\n";
+    close($fh);
+
+}
+
+sub help {
+
+    print "\n  [!] Error: Invalid option. Please check the help\n" if ($_[0]);
+
+    die <<HELP;
+
+ consensusFold (using RNA Framework v$Core::Utils::VERSION)
+
+ Author:  Danny Incarnato (dincarnato[at]rnaframework.com)
+ Summary: Prediction of consensus structure from multiple reactivity profiles
+
+ Usage:   consensusFold [Options] XML_dir_1/ XML_dir_2/ ... XML_dir_n/
+
+ Options                               Description
+ -o  or --output          <string>     Output directory (Default: consensusFold_out/)
+ -ow or --overwrite                    Overwrites output directory (if the specified directory already exists)
+ -p  or --processors      <int>        Number of processors to use (>=1, Default: 1)
+ -sl or --slope           <float>      Sets the slope used with structural probing data restraints (Default: 1.8 [kcal/mol])
+ -in or --intercept       <float>      Sets the intercept used with structural probing data restraints (Default: -0.6 [kcal/mol])
+
+HELP
+
+}

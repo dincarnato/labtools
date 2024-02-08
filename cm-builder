@@ -1,9 +1,13 @@
 #!/usr/bin/perl
 
 use strict;
+use File::Copy;
 use Getopt::Long qw(:config no_ignore_case);
+use POSIX ();
+use Storable;
 
 use Core::Mathematics qw(:all);
+use Core::Statistics;
 use Core::Utils;
 use Data::IO::Sequence;
 use Data::Sequence::Utils;
@@ -17,67 +21,82 @@ my ($help, $motiffile, $iterations, $dbfile,
     $evalue, $minbpfrac, $postollerance, $mincov,
     $seqfile, $seq, $minlen, $rscape, $onlyStockholm,
     $stopIfFirstZero, $rscapeEvalue, $skipRscape, $useHelixAggregatedEvalue,
-    %sequences);
+    $onGenome, $evalueDecrease, $useBitScore, $bitScore,
+    $bitScoreIncrease, $storeDb, $noiseEstimate, $originalBitScore,
+    $originalEvalue, $decoySize, %sequences);
 
 do {
 
     local $SIG{__WARN__} = sub { };
 
-    GetOptions( "h|help"                        => \$help,
-                "s|sequence-file=s"             => \$seqfile,
-                "m|motif-file=s"                => \$motiffile,
-                "d|db-file=s"                   => \$dbfile,
-                "i|iterations=i"                => \$iterations,
-                "t|pos-tollerance=s"            => \$postollerance,
-                "q|min-query-cov=s"             => \$mincov,
-                "T|tmp-dir=s"                   => \$tmpdir,
-                "o|out-dir=s"                   => \$output,
-                "p|press"                       => \$press,
-                "k|keep-alignment"              => \$keepaln,
-                "c|cpu=i"                       => \$threads,
-                "E|evalue=s"	                => \$evalue,
-                "b|min-bp-fraction=s"           => \$minbpfrac,
-                "l|min-len=i"                   => \$minlen,
-		        "f|stop-if-first-zero"          => \$stopIfFirstZero,
-                "P|path-to-infernal=s"          => \$path,
-                "R|path-to-rscape=s"            => \$rscape,
-		        "S|only-stockholm"              => \$onlyStockholm,
-                "r|skip-rscape"                 => \$skipRscape,
-                "e|rscape-evalue=s"             => \$rscapeEvalue,
-                "a|use-helix-aggregated-evalue" => \$useHelixAggregatedEvalue ) or help(1);
+    GetOptions( "h|help"                           => \$help,
+                "s|sequence-file=s"                => \$seqfile,
+                "m|motif-file=s"                   => \$motiffile,
+                "d|db-file=s"                      => \$dbfile,
+                "i|iterations=i"                   => \$iterations,
+                "g|on-genome"                      => \$onGenome,
+                "D|iterative-evalue-decrease=s"    => \$evalueDecrease,
+                "t|pos-tollerance=s"               => \$postollerance,
+                "q|min-query-cov=s"                => \$mincov,
+                "M|tmp-dir=s"                      => \$tmpdir,
+                "o|out-dir=s"                      => \$output,
+                "p|press"                          => \$press,
+                "k|keep-alignment"                 => \$keepaln,
+                "c|cpu=i"                          => \$threads,
+                "E|evalue=s"	                   => \$evalue,
+                "b|min-bp-fraction=s"              => \$minbpfrac,
+                "l|min-len=i"                      => \$minlen,
+		        "f|stop-if-first-zero"             => \$stopIfFirstZero,
+                "P|path-to-infernal=s"             => \$path,
+                "R|path-to-rscape=s"               => \$rscape,
+		        "S|only-stockholm"                 => \$onlyStockholm,
+                "r|skip-rscape"                    => \$skipRscape,
+                "e|rscape-evalue=s"                => \$rscapeEvalue,
+                "a|use-helix-aggregated-evalue"    => \$useHelixAggregatedEvalue,
+                "B|use-bit-score"                  => \$useBitScore,
+                "T|bit-score=s"                    => \$bitScore,
+                "I|iterative-bit-score-increase=s" => \$bitScoreIncrease,
+                "O|store-db"                       => \$storeDb,
+                "N|noise-estimate"                 => \$noiseEstimate,
+                "ds|decoy-size=s"                  => \$decoySize ) or help(1);
 
-};
+}; 
 
 help() if ($help);
 
+$bitScore //= 0;
 $mincov ||= 0.5;
 $postollerance ||= 0.035;
 $minbpfrac ||= 0.5;
 $threads ||= 1;
 $evalue ||= 10;
 $rscapeEvalue ||= 0.1;
+$decoySize ||= 0.1;
 $tmpdir ||= "/tmp/";
 $output ||= "./";
+$evalueDecrease //= 0;
 $tmpdir =~ s/\/?$/\//;
 $output =~ s/\/?$/\//;
 $iterations ||= 3;
 $minlen ||= 100;
+$originalEvalue = $evalue;
+$originalBitScore = $bitScore;
 
 die "\n[!] Error: Number of CPUs must be >= 1\n\n" if (!ispositive($threads));
-die "\n[!] Error: E-value must be >= 0\n\n" if (!isnumeric($evalue) ||
-                                                !ispositive($evalue));
-die "\n[!] Error: R-scape E-value must be >= 0\n\n" if (!isnumeric($rscapeEvalue) ||
-                                                        !ispositive($rscapeEvalue));
+die "\n[!] Error: E-value must be >= 0\n\n" if (!isnumeric($evalue) || !ispositive($evalue));
+die "\n[!] Error: R-scape E-value must be >= 0\n\n" if (!isnumeric($rscapeEvalue) || !ispositive($rscapeEvalue));
 die "\n[!] Error: Number of iterations must be >= 1\n\n" if (!ispositive($iterations));
-die "\n[!] Error: Minimum base-pair fraction must be comprised between 0 and 1\n\n" if (!isnumeric($minbpfrac) ||
-                                                                                        !inrange($minbpfrac, [0, 1]));
-die "\n[!] Error: Minimum query coverage must be comprised between 0 and 1\n\n" if (!isnumeric($mincov) ||
-                                                                                    !inrange($mincov, [0, 1]));
-die "\n[!] Error: Position tollerance must be comprised between 0 and 1\n\n" if (!isnumeric($postollerance) ||
-                                                                                 !inrange($postollerance, [0, 1]));
+die "\n[!] Error: Minimum base-pair fraction must be comprised between 0 and 1\n\n" if (!isnumeric($minbpfrac) || !inrange($minbpfrac, [0, 1]));
+die "\n[!] Error: Minimum query coverage must be comprised between 0 and 1\n\n" if (!isnumeric($mincov) || !inrange($mincov, [0, 1]));
+die "\n[!] Error: Position tollerance must be comprised between 0 and 1\n\n" if (!isnumeric($postollerance) || !inrange($postollerance, [0, 1]));
+die "\n[!] Error: E-value decrease must be > 1\n\n" if (!isnumeric($evalueDecrease) || !ispositive($evalueDecrease) || ($evalueDecrease > 0 && $evalueDecrease <= 1));
 die "\n[!] Error: Sequence file does not exist\n\n" if (!-e $seqfile);
 die "\n[!] Error: Motif file does not exist\n\n" if (!-e $motiffile);
 die "\n[!] Error: DB file does not exist\n\n" if (!-e $dbfile);
+die "\n[!] Error: Bit score threshold must be >= 0\n\n" if (!ispositive($bitScore));
+die "\n[!] Error: Bit score increase must be > 0\n\n" if (defined $bitScoreIncrease && (!isnumeric($bitScoreIncrease) || !ispositive($bitScoreIncrease)));
+die "\n[!] Error: Noise estimation requires bit score-based model generation (-B)\n\n" if (!$useBitScore && $noiseEstimate);
+die "\n[!] Error: Decoy database size must be comprised between 0.1 and 1 \n\n" if (!isnumeric($decoySize) || !inrange($decoySize, [0.1, 1]));
 
 if (defined $path) {
 
@@ -115,18 +134,68 @@ die "\n[!] Error: Provided temporary path does not point to a folder\n\n" if (!-
 
 $motifio = Data::IO::Sequence->new( file         => $motiffile,
                                     lonelypairs  => 1 );
-$dbio = Data::IO::Sequence->new(file => $dbfile);
 $seq = Data::IO::Sequence->new(file => $seqfile)->read();
 
 die "\n[!] Error: Unable to read sequence file\n\n" if (!defined $seq);
 
-print "\n[+] Importing sequence database...";
+print "\n[!] Note: Using bit scores. E-values will be ignored...\n" if ($useBitScore);
 
-while(my $entry = $dbio->read()) { $sequences{$entry->id()} = $entry->sequence(); } # Runtime build index
+if ($dbfile =~ m/\.storable$/) {
+
+    print "\n[+] Importing sequence database from storable file...";
+
+    my $sequences = retrieve($dbfile);
+    %sequences = %{$sequences};
+    $dbfile =~ s/\.storable$//;
+
+}
+else {
+
+    print "\n[+] Importing sequence database...";
+
+    $dbio = Data::IO::Sequence->new(file => $dbfile);
+
+    while(my $entry = $dbio->read()) { $sequences{$entry->id()} = $entry->sequence(); } # Runtime build index
+
+    store \%sequences, $dbfile . ".storable" if ($storeDb);
+
+}
 
 print " " . (keys %sequences) . " imported.";
 
 die "\n\n[!] Error: Sequence database is empty\n\n" if (!keys %sequences);
+
+if (!-e $dbfile) { # Only in case the file passed was a Storable
+
+    print "\n[+] FASTA database file \"" . $dbfile . "\" not found." .
+          "\n    Regenerating from Storable object...";
+
+    open(my $fh, ">", $dbfile) or die "\n\n[!] Error: Unable to write to database file (" . $! . ")\n\n";
+    select((select($fh), $|=1)[0]);
+    print $fh ">" . $_ . "\n" . $sequences{$_} . "\n" for (sort keys %sequences);
+    close($fh);
+
+}
+
+if ($noiseEstimate) {
+
+    my ($n, $max);
+    $n = 0;
+    $max = max(1, round(scalar(keys %sequences) * $decoySize));
+
+    open(my $wh, ">", $tmpdir . "db.rev.fasta") or die "\n\n[!] Error: Unable to write reversed DB for noise estimation ($!)\n\n";
+    select((select($wh), $|=1)[0]);
+    foreach my $id (keys %sequences) {
+
+        $n++;
+        print $wh ">" . $id . "\n" . rev($sequences{$id}) . "\n";
+
+        last if ($n == $max);
+
+    }
+    close($wh);
+
+}
 
 print "\n[+] Generating initial Stockholm motif file...";
 
@@ -136,7 +205,7 @@ while (my $motif = $motifio->read()) {
     my ($haspk, $id, $basename, $ret,
         $motiflen, $mstart, $mend, $eta,
         $enlarged, $seqnogaps, $structnogaps, $lastCovarying,
-        $lastIter, @eta, @nogaps, @mseq, @mstruct);
+        $lastIter, $nBasePairs, @eta, @nogaps, @mseq, @mstruct);
 
     $lastCovarying = 0;
     $id = $motif->id();
@@ -148,6 +217,7 @@ while (my $motif = $motifio->read()) {
     @mstruct = @mstruct[@nogaps];
     $seqnogaps = join("", @mseq);
     $structnogaps = join("", @mstruct);
+    $nBasePairs = scalar(map { $_ } listpairs($structnogaps));
     $motiflen = length($seqnogaps);
     $mstart = index(rna2dna($seq->sequence()), $seqnogaps, 0);
     $mend = $mstart + $motiflen - 1;
@@ -156,13 +226,25 @@ while (my $motif = $motifio->read()) {
 
     if ($mstart == -1) {
 
-        print " not found.";
-        print STDERR "\n\n[!] Error: Cannot find motif $id in sequence file. Skipping...\n";
+        if ($onGenome) {
 
-        next MOTIF;
+            $mstart = index(revcomp(rna2dna($seq->sequence())), $seqnogaps, 0);
+            $mend = $mstart + $motiflen - 1;
+
+        }
+
+        if ($mstart == -1) {
+
+            print " not found.";
+            print STDERR "\n\n[!] Error: Cannot find motif $id in sequence file. Skipping...\n";
+
+            next MOTIF;
+
+        }
 
     }
-    else { print " found at " . $mstart . "-" . $mend . "."; }
+    
+    print " found at " . $mstart . "-" . $mend . ".";
 
     if ($seqnogaps < $minlen) {
 
@@ -193,6 +275,19 @@ while (my $motif = $motifio->read()) {
     ITER:
     foreach my $iter (1 .. $iterations) {
 
+        if ($iter == 1) {
+
+            $evalue = $originalEvalue;
+            $bitScore = $originalBitScore;
+
+        }
+        else {
+
+            $evalue /= $evalueDecrease if ($evalueDecrease);
+            $bitScore += $bitScoreIncrease if ($bitScoreIncrease);
+
+        }
+
         my ($stockname, %matches, %seen);
 
         print "\n[+] Building covariance model (iteration " . $iter . ")...\n" .
@@ -203,20 +298,90 @@ while (my $motif = $motifio->read()) {
         $ret =~ s/^/    /gm;
         print $ret;
 
-        $ret = `$path/cmcalibrate --forecast --nforecast $threads $basename.cm`;
-        (@eta) = $ret =~ m/(\d{2}):(\d{2}):(\d{2})/;
-        $eta = $eta[0] ? $eta[0] . " h and " . $eta[1] . " min" : $eta[1] . " min and " . $eta[2] . " sec";
+        if (!$useBitScore) {
 
-        print "\n[+] Calibrating covariance model (estimated time: " . $eta . ")...\n" .
-              "    Output from cmcalibrate:\n\n";
+            $ret = `$path/cmcalibrate --forecast --nforecast $threads $basename.cm`;
+            (@eta) = $ret =~ m/(\d{2}):(\d{2}):(\d{2})/;
+            $eta = $eta[0] ? $eta[0] . " h and " . $eta[1] . " min" : $eta[1] . " min and " . $eta[2] . " sec";
 
-        $ret = `$path/cmcalibrate --cpu $threads $basename.cm`;
-        $ret =~ s/^/    /gm;
-        print $ret;
+            print "\n[+] Calibrating covariance model (estimated time: " . $eta . ")...\n" .
+                "    Output from cmcalibrate:\n\n";
+
+            $ret = `$path/cmcalibrate --cpu $threads $basename.cm`;
+            $ret =~ s/^/    /gm;
+            print $ret;
+
+        }
+        else {
+
+            print "\n[+] Skipping calibration and tweaking covariance model ECM fields...";
+
+            open(my $fh, "<", "$basename.cm") or die "\n\n[!] Error: Unable to open \"$basename.cm\" covariance model ($!)\n\n";
+            open(my $wh, ">", "$basename\_tweaked.cm") or die "\n\n[!] Error: Unable to write \"$basename\_tweaked.cm\" for writing ($!)\n\n";
+            select((select($wh), $|=1)[0]);
+            while(<$fh>) {
+
+                if ($_ =~ m/^CM/) { 
+
+                    # Fake parameters to trick cmsearch into believing that model has been calibrated
+                    # Note: these can be from any covariance model previously calibrated with cmcalibrate
+                    print $wh "ECMLC    0.63176    -8.77289     0.75444     1600000	  493377  0.002432\n" .
+                              "ECMGC    0.36462   -17.10043    -6.65293     1600000	   18048  0.022163\n" .
+                              "ECMLI    0.55422    -8.08034     2.28081     1600000	  374141  0.003207\n" .
+                              "ECMGI    0.38936   -10.69556    -0.96911     1600000	   17651  0.022662\n";
+
+                }
+
+                print $wh $_;
+
+            }
+            close($wh);
+            close($fh);
+
+            # Overwriting tweaked coveriance model
+            copy("$basename\_tweaked.cm", "$basename.cm");
+            unlink("$basename\_tweaked.cm");
+
+        }
+
+        if ($noiseEstimate) {
+
+            print "\n[+] Estimating noise threshold in decoy DB...";
+
+            my $cmd = "$path/cmsearch --noali --tblout $basename\_decoy.out" . ($onGenome ? " " : " --toponly ") . "--nohmmonly " .
+                       ($useBitScore ? "-T $bitScore" : "-E $evalue --incE $evalue") . " --cpu $threads $basename.cm " . $tmpdir . "db.rev.fasta";
+            $ret = `$cmd`;
+
+            open(my $fh, "<", "$basename\_decoy.out") or die "\n\n[!] Error: failed to open cmsearch output ($!)\n\n";
+            while(<$fh>) {
+
+                chomp();
+
+                $_ =~ s/\s+/ /g;
+
+                next if ($_ =~ m/^#/);
+
+                my @row = split(" ", $_);
+                my $noiseThresh = POSIX::ceil(($row[14]  + 0.1) / 5) * 5;
+
+                print " bit score noise " . $row[14] . ", threshold set to $noiseThresh";
+
+                $bitScore = max($bitScore, $noiseThresh);
+
+                last;
+
+            }
+            close($fh);
+
+            unlink("$basename\_decoy.out");
+
+        }
 
         print "\n[+] Searching DB with covariance model...";
 
-        $ret = `$path/cmsearch --noali --tblout $basename.out --toponly --nohmmonly -E $evalue --incE $evalue --cpu $threads $basename.cm $dbfile`;
+        my $cmd = "$path/cmsearch --noali --tblout $basename.out" . ($onGenome ? " " : " --toponly ") . "--nohmmonly " .
+                  ($useBitScore ? "-T $bitScore" : "-E $evalue --incE $evalue") . " --cpu $threads $basename.cm $dbfile";
+        $ret = `$cmd`;
 
         open(my $fh, "<", "$basename.out") or die "\n\n[!] Error: failed to open cmsearch output ($!)\n\n";
         while(<$fh>) {
@@ -226,26 +391,48 @@ while (my $motif = $motifio->read()) {
             $_ =~ s/\s+/ /g;
 
             next if ($_ =~ m/^#/);
-            next if ($_ !~ m/!/);
+            next if (!$useBitScore && $_ !~ m/!/);
 
             my @row = split(" ", $_);
 
-            my ($refid, $queryfrom, $queryto, $start, $end) = ($row[0], @row[5..8]);
+            my $revComp = 0;
+            my ($refid, $queryfrom, $queryto, $start, $end, $score) = ($row[0], @row[5..8], $row[14]);
             $start--;
             $end--;
+
+            # Match is on the minus strand
+            if ($onGenome && $start > $end) {
+
+                ($start, $end) = ($end, $start);
+                $revComp = 1;
+
+            }
 
             next if (($queryto - $queryfrom + 1) / ($mend - $mstart + 1) < $mincov);
             next if (!intersect([($mstart / $seq->length()) - $postollerance, ($mend / $seq->length()) + $postollerance],
                                 [($start / (length($sequences{$refid}) - 1)), ($end / (length($sequences{$refid}) - 1))]));
 
-            $matches{$refid} = [$start, $end] if (!exists $matches{$refid});
+            $matches{$refid} = [$start, $end, $revComp, $score] if (!exists $matches{$refid});
 
         }
         close($fh);
 
         unlink($basename . ".out");
 
-        $matches{$_} = substr($sequences{$_}, $matches{$_}->[0], $matches{$_}->[1] - $matches{$_}->[0] + 1) for (keys %matches);
+        if ($useBitScore) { 
+            
+            print " bit score threshold $bitScore,"; 
+            %matches = map { $_ => $matches{$_} } grep { $matches{$_}->[3] >= $bitScore } keys %matches;
+
+        }
+        else { print " E-value threshold $evalue,"; }
+
+        for (keys %matches) {
+
+            my $seqMatch = substr($sequences{$_}, $matches{$_}->[0], $matches{$_}->[1] - $matches{$_}->[0] + 1);
+            $matches{$_} = $onGenome && $matches{$_}->[2] ? revcomp($seqMatch) : $seqMatch;
+
+        }
 
         print " " . keys(%matches) . " matches found.";
 
@@ -290,7 +477,7 @@ while (my $motif = $motifio->read()) {
         $ret =~ s/^/    /gm;
         print $ret;
 
-        if (!selectValidAln($basename . "_" . $iter)) {
+        if (!selectValidAln($basename . "_" . $iter, $nBasePairs)) {
 
             print STDERR "\n\n[!] Error: No sequences left for motif $id in alignment. Skipping...\n\n";
 
@@ -413,6 +600,7 @@ sub fasta2stockholm {
 sub selectValidAln {
 
     my $basename = shift;
+    my $nBasePairs = shift;
 
     my ($stockstruct, $maxlen, %stock);
     $maxlen = 0;
@@ -442,6 +630,8 @@ sub selectValidAln {
     $stockstruct =~ tr/<>[]{}/()()()/;
     my @stockpairs = listpairs($stockstruct);
 
+    return if (scalar(@stockpairs) / $nBasePairs < $minbpfrac);
+
     foreach my $id (keys %stock) {
 
         $maxlen = max($maxlen, length($id));
@@ -453,7 +643,7 @@ sub selectValidAln {
 
         my ($canonical, $noncanonical) = rmnoncanonical($stockseq, $stockstruct);
 
-        delete($stock{$id}) if (scalar(@{$canonical}) / scalar(@stockpairs) < $minbpfrac);
+        delete($stock{$id}) if (scalar(@{$canonical}) / $nBasePairs < $minbpfrac);
 
     }
 
@@ -520,13 +710,18 @@ sub help {
  Options                                             Description
  -m  or --motif-file                    <string>     Path to the RNA structure motif's file (in Vienna format)
  -d  or --db-file                       <string>     Path to the DB file of potentially related sequences (in FASTA format)
+ -O  or --store-db                                   Database will be dumped to file in Perl's Storable format for faster loading on the next
+                                                     execution. File will be stored in the same path as the DB file, with appended ".storable"
+                                                     extension
  -s  or --sequence-file                 <string>     Path to the original sequence file (from which the motif has been extracted, in FASTA format)
+ -g  or --on-genome                                  Assumes that the covariance model is built by using a database of genomic sequences, hence
+                                                     matches on both genomic strands must be retained
  -b  or --min-bp-fraction               <float>      Fraction of base-pairs that should be present in each sequence to retain it (Default: 0.5 [50%])
  -q  or --min-query-cov                 <float>      Minimum query motif coverage (in case of truncated motifs) (Default: 0.5 [50%])
  -t  or --pos-tollerance                <float>      Maximum tollerance for shift in position of the motif (Default: 0.035 [3.5%])
+                                                     Note: when working on genomic sequences (-g), it is advisable to increase this to 1
  -l  or --min-len                       <int>        If the provided motif is shorter than this length, it is first extended up to this length before
                                                      performing the search, to maximize the chances of finding matches (Default: 100)
- -E  or --evalue                        <float>      Threshold E-value for including a match (Default: 10)
  -e  or --rscape-evalue                 <float>      Threshold E-value for considering a base-pair to significantly covary (Default: 0.1)
  -a  or --use-helix-aggregated-evalue                At each iteration, the number of significantly covarying helices is evaluated instead of the number 
                                                      of significantly covarying base-pairs (requires R-scape v2.0.0.q)
@@ -540,10 +735,30 @@ sub help {
  -P  or --path-to-infernal              <string>     Path to Infernal executables (Default: assumes all executables are in PATH)
  -R  or --path-to-rscape                <string>     Path to R-scape executable (Default: assumes R-scape is in PATH)
  -c  or --cpu                           <int>        Number of processors to use for Infernal processes (Default: 1)
- -T  or --tmp-dir                       <string>     Path to a temporary folder (Default: /tmp)
+ -M  or --tmp-dir                       <string>     Path to a temporary folder (Default: /tmp)
  -o  or --out-dir                       <string>     Path to the output directory (Default: ./)
+
+ |
+ +- E-value-based model building (default, slow)
+    -E  or --evalue                        <float>      Threshold E-value for including a match (Default: 10)
+    -D  or --iterative-evalue-decrease     <float>      Threshold E-value (-E) will be decreased at each iteration by this fold (for example, if -E 10 and
+                                                        -D 2, the E-value threshold will become 5 at the second iteration, 2.5 at the third iteration, etc.)
+                                                        (>=2, Default: 0)
+
+ |
+ +- Bit score-based model building (faster)
+    -B  or --use-bit-score                              When specified, the calibration of the covariance model with cmcalibrate is skipped and bit scores
+                                                        are used instead of E-values (parameters -E and -D will be ignored) to select potential matches
+    -T  or --bit-score                     <float>      Bit score threshold for including a match (Default: 0)
+    -I  or --iterative-bit-score-increase  <float>      Bit score threshold (-T) will be increased at each iteration by this value (Default: 0)
+    -N  or --noise-estimate                <float>      A "decoy" database is generated by reversing a subset of the sequences in the DB file (controlled by -ds)
+                                                        and used to estimate a noise threshold for the bit score. The bit score at each iteration is then rounded 
+                                                        up to the nearest multiple of 5
+                                                        Note: the estimated bit score overrides the bit score threshold (-T)
+    -ds or --decoy-size                    <float>      Fraction of sequences of the database to be reversed and used to build the decoy database (0.1-1, Default: 0.1)
 
 
 HELP
 
 }
+

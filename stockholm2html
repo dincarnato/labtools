@@ -1,0 +1,201 @@
+#!/usr/bin/perl
+
+use strict;
+use File::Basename;
+use Getopt::Long qw(:config no_ignore_case);
+
+use lib "/path/to/RNAFramework/lib";
+
+use Core::Utils;
+use Core::Mathematics qw(:all);
+use RNA::Utils;
+
+$|++;
+
+my ($struct, $cleanStruct, $structNoSpaces, $helices, 
+    $html, $longestId, $darkMode, $title, $input,
+    $discardedAln, $help, $output, @struct, @pairs, 
+    @bgColors, @txColors, %seq, %discarded);
+@bgColors = qw(#9e0142 #5e4fa2 #d53e4f #3288bd #f46d43 #66c2a5 #fdae61 #abdda4 #fee08b #e6f598);
+@txColors = qw(white white white white black black black black black black);
+
+do {
+
+    local $SIG{__WARN__} = sub { };
+
+    GetOptions( "h|help"           => \$help,
+                "d|dark"           => \$darkMode,
+                "r|discardedAln=s" => \$discardedAln,
+                "o|output=s"       => \$output,
+                "t|title=s"        => \$title ) or help(1);
+
+    $input = $ARGV[0];
+
+};
+
+help() if ($help);
+
+$output = (fileparse($input, qr/\.st(?:o(?:ckholm)|k)$/))[0] . ".html" if (!defined $output);
+$title = (fileparse($input, qr/\.st(?:o(?:ckholm)|k)$/))[0] if (!defined $title);
+
+die "\n[!] Error: No input Stockholm file provided\n\n" if (!defined $input);
+die "\n[!] Error: Provided input Stockholm file does not exist\n\n" if (!-e $input);
+die "\n[!] Error: Provided discarded alignments Stockholm file does not exist\n\n" if (defined $discardedAln && !-e $discardedAln);
+
+open(my $fh, "<", $input) or die "\n[!] Error: Unable to read input Stockholm file ($!)\n\n";
+while(<$fh>) {
+
+    chomp();
+
+    if (/^#=GC SS_cons/ || /^[^#\/]/) {
+
+        my @row = split " ";
+
+        if ($row[1] eq "SS_cons") { $struct = $row[2]; }
+        else { $seq{$row[0]} = [ split //, $row[1] ]; }
+
+    }
+
+}
+close($fh);
+
+if (defined $discardedAln) {
+
+    open($fh, "<", $discardedAln) or die "\n[!] Error: Unable to read discarded alignments Stockholm file ($!)\n\n";
+    while(<$fh>) {
+
+        chomp();
+
+        if (/^#=GC SS_cons/ || /^[^#\/]/) {
+
+            my @row = split " ";
+            $discarded{$row[0]} = [ split //, $row[1] ] if ($row[1] ne "SS_cons");
+
+        }
+
+    }
+    close($fh);
+
+}
+
+die "\n[!] Error: No structure found in Stockholm file (missing #=GC SS_cons field)\n\n" if (!defined $struct);
+
+$longestId = max(map { length($_) } (keys %seq, keys %discarded), length("Structure"));
+$cleanStruct = $struct;
+$cleanStruct =~ s/[^\(\)\[\]\{\}<>]/./g;
+$cleanStruct =~ tr/<>[]{}/()()()/;
+$structNoSpaces = $cleanStruct;
+$structNoSpaces =~ s/\(\.+\(/((/g while ($structNoSpaces =~ /\(\.+\(/);
+$structNoSpaces =~ s/\)\.+\)/))/g while ($structNoSpaces =~ /\)\.+\)/);
+$helices = (listhelices($structNoSpaces))[0];
+@struct = split //, $cleanStruct;
+@pairs = listpairs($cleanStruct);
+
+$html = "<!DOCTYPE html>\n" .
+        "<html>\n" .
+        "<head>\n" .
+        (defined $title ? "    <title>$title</title>\n" : undef) .
+        "    <style>\n";
+$html .=  "        body { font-family: Helvetica, Arial, sans-serif;";
+$html .= $darkMode ? "\n               background-color: #383e42;\n" .
+                     "               color: #ffffff; }\n" : " }\n";
+$html .= "        .dh { background-color: " . ($darkMode ? "white" : "#383e42") . ";" .
+                      " color: " . ($darkMode ? "black" : "white") . "; }\n" .
+         "        .did { color: " . ($darkMode ? "#ee4b2b" : "#880808") . "; }\n" if (defined $discardedAln);
+
+while (my $helix = shift(@$helices)) {
+
+    my ($helixId, $helixColor, $textColor, $nPairs);
+    $helixId = "h" . scalar(@$helices);
+    $helixColor = shift(@bgColors);
+    $textColor = shift(@txColors);
+    $nPairs = scalar(@{$helix->{h5bases}});
+    $html .= "        .$helixId { background-color: " . $helixColor . "; color: " . $textColor . "; }\n";
+    $html .= "        .s$helixId { color: " . $helixColor . "; }\n" if (!$darkMode);
+
+    while ($nPairs) {
+
+        $nPairs--;
+
+        my ($i, $j) = @{shift(@pairs)};
+        $struct[$i] = "<span class=\"" . ($darkMode ? undef : "s") . "$helixId\">" . $struct[$i] . "</span>";
+        $struct[$j] = "<span class=\"" . ($darkMode ? undef : "s") . "$helixId\">" . $struct[$j] . "</span>";
+
+        foreach my $id (keys %seq) {
+
+            $seq{$id}->[$i] = "<span class=\"$helixId\">" . $seq{$id}->[$i] . "</span>"; 
+            $seq{$id}->[$j] = "<span class=\"$helixId\">" . $seq{$id}->[$j] . "</span>";
+
+        }
+
+        if (defined $discardedAln) {
+
+            foreach my $id (keys %discarded) {
+
+                $discarded{$id}->[$i] = "<span class=\"dh\">" . $discarded{$id}->[$i] . "</span>"; 
+                $discarded{$id}->[$j] = "<span class=\"dh\">" . $discarded{$id}->[$j] . "</span>";
+
+            }
+
+        }
+ 
+    }
+
+    # Prevents the colors array from being exhausted
+    push(@bgColors, $helixColor);
+    push(@txColors, $textColor);
+
+}
+
+$html .= "    </style>\n" .
+         "</head>\n" .
+         "<body>\n" .
+         (defined $title ? "    <h1>$title</h1>\n" : undef) .
+         "    <h2>Alignment:</h2>\n" .
+         "    <pre>\n";
+
+$html .= "<strong>$_</strong>" . (" " x ($longestId - length($_) + 5)) . join("", @{$seq{$_}}) . "\n" for (sort keys %seq);
+$html .= "\n\n" .
+         "<strong>Structure</strong>" . (" " x ($longestId - length("Structure") + 5)) . join("", @struct) . "\n" .
+         "   </pre>\n";
+
+if (defined $discardedAln) {
+
+    $html .= "    <pre>\n\n";
+    $html .= "<span class=\"did\"><strong>$_</strong></span>" . (" " x ($longestId - length($_) + 5)) . join("", @{$discarded{$_}}) . "\n" for (sort keys %discarded);
+    $html .= "   </pre>\n";
+
+}
+
+$html .= <<HTML;
+</body>
+</html>
+HTML
+
+open(my $wh, ">", $output) or die "\n[!] Error: Unable to write output HTML file ($!)\n\n";
+select((select($wh), $|=1)[0]);
+print $wh $html;
+close($wh);
+
+sub help {
+
+    print "\n  [!] Error: Invalid option. Please check the help\n" if ($_[0]);
+
+    die <<HELP;
+
+ stockholm2html (using RNAFramework libs v$Core::Utils::VERSION)
+
+ Author:  Danny Incarnato (danny[at]laddertx.com)
+ Summary: Generates structure-wise colorized RNA alignments in HTML format from a Stockholm file
+
+ Usage:   stockholm2html file.sto
+
+ Options                                Description
+ -o or --output             <string>    Output HTML file (Default: <input>.html)
+ -r or --discardedAln       <string>    An optional file of discarded alignments (generated by stockholmPolish)
+ -t or --title              <string>    Title of the output HTML page
+ -d or --dark                           Enables dark coloring mode
+
+HELP
+
+}

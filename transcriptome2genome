@@ -1,0 +1,181 @@
+#!/usr/bin/perl
+
+use strict;
+use Getopt::Long qw(:config no_ignore_case);
+
+use Core::Mathematics qw(:all);
+
+$|++;
+
+my ($annoFile, $isGTF, $input, $bed12,
+    $output, $help, %annotation);
+
+do {
+
+    local $SIG{__WARN__} = sub { };
+
+    GetOptions( "h|help"         => \$help,
+                "o|output=s"     => \$output,
+                "a|annotation=s" => \$annoFile,
+                "b12|bed12"      => \$bed12 ) or help(1);
+
+    $input = $ARGV[0];
+
+};
+
+help() if ($help);
+
+if (!$output) {
+
+    $output = $input;
+    $output =~ s/\.bed$//i;
+    $output .= ".genomeLevel.bed";
+
+}
+
+die "\n[!] Error: No input BED file provided\n\n" if (!$input);
+die "\n[!] Error: No annotation file specified\n\n" if (!$annoFile);
+die "\n[!] Error: Specified annotation file does not exist\n\n" if (!-e $annoFile);
+
+$isGTF = 1 if (substr($annoFile, -3) eq "gtf");
+
+print "\n[+] Importing annotation file...";
+
+open(my $fh, "<", $annoFile) or die "\n[!] Error: Unable to read from annotation file ($!)\n\n";
+while(<$fh>) {
+
+    chomp;
+
+    my ($id, @row);
+    @row = split /\t/;
+
+    if ($isGTF) {
+
+        die "\n[!] Error: Import of GTF annotation file is not yet implemented\n\n";
+
+    }
+    else {
+
+        next if (@row < 4);
+
+        my (@starts, @lens);
+        $id = $row[3];
+        @lens = split /,/, $row[10];
+        @starts = split /,/, $row[11];
+        $annotation{$id} = { strand => @row >= 6 ? $row[5] : "+",
+                             start  => $row[1],
+                             chr    => $row[0],
+                             length => sum(@lens),
+                             exons  => [ map { [$starts[$_], ($starts[$_] + $lens[$_] - 1)] } 0 .. $#starts ] };
+
+    }
+
+}
+close($fh);
+
+print "\n[+] Converting input file...";
+
+open($fh, "<", $input) or die "\n[!] Error: Unable to read from input BED file ($!)\n\n";
+open(my $wh, ">", $output) or die "\n[!] Error: Unable to write to output file ($!)\n\n";
+select((select($wh), $|=1)[0]);
+
+while(<$fh>) {
+
+    chomp;
+
+    my ($anno, $lastRelEnd, $offset, @row, @junctions, @blocks);
+    @row = split /\t/;
+
+    next if (@row < 3);
+    next if (!exists $annotation{$row[0]});
+
+    $lastRelEnd = 0;
+    $anno = $annotation{$row[0]};
+
+    # Block extends past transcript end
+    next if ($row[2] > $anno->{length});
+
+    $row[2]--;
+    @blocks = $anno->{strand} eq "+" ? ([$row[1], $row[2]]) : ([$anno->{length} - $row[2] - 1, $anno->{length} - $row[1] - 1]);
+
+    for (my $i = 0; $i < @{$anno->{exons}}; $i++) {
+
+        my ($exon, $relExon);
+        $exon = $anno->{exons}->[$i];
+        $relExon = [$lastRelEnd, $lastRelEnd + abs(diff(@$exon))];
+        $lastRelEnd = $relExon->[1] + 1;
+
+        next if (!inrange($blocks[-1]->[0], $relExon));
+
+        push(@{$blocks[-1]}, $i);
+
+        if (!inrange($blocks[-1]->[1], $relExon)) {
+
+            push(@blocks, [$relExon->[1] + 1, $blocks[-1]->[1]]);
+            $blocks[-2]->[1] = $relExon->[1];
+
+        }
+
+        $offset = $relExon->[0] if (!defined $offset);
+
+    }
+
+    # The exon number has not been added, so it means the block didn't fall within an intron
+    next if (@{$blocks[0]} != 3);
+
+    $blocks[0]->[0] -= $offset;
+    $blocks[0]->[1] -= $offset;
+
+    for my $i (0 .. $#blocks) {
+
+        my ($start, $end, $n, $blockLen, $exonStart);
+        ($start, $end, $n) = @{$blocks[$i]};
+        $blockLen = $end - $start;
+        $exonStart = $anno->{exons}->[$n]->[0];
+        $exonStart += $start if (!$i);
+        $blocks[$i] = [$exonStart + $anno->{start}, $blockLen + $exonStart + $anno->{start} + 1, $blockLen];
+
+    }
+
+    if ($bed12) {
+
+        my ($start, $end, @starts, @lens);
+        $start = $blocks[0]->[0];
+        $end = $blocks[-1]->[1];
+        @starts = map { $_->[0] - $start } @blocks;
+        @lens = map { $_->[2] + 1 } @blocks;
+
+        print $wh join("\t", $anno->{chr}, $start, $end, @row > 3 ? $row[3] : $row[0], 0, $anno->{strand}, $start, $end, "0,0,0", scalar(@blocks), join(",", @lens), join(",", @starts)) . "\n";
+
+    }
+    else { print $wh join("\t", $anno->{chr}, @$_[0,1], @row > 3 ? $row[3] : $row[0], 0, $anno->{strand}) . "\n" for (@blocks); }
+
+}
+close($fh);
+close($wh);
+
+print "\n[+] All done.\n\n";
+
+sub help {
+
+    print "\n  [!] Error: Invalid option. Please check the help\n" if ($_[0]);
+
+    die <<HELP;
+
+ transcriptome2genome (v$Core::Utils::VERSION)
+
+ Author:  Danny Incarnato (dincarnato[at]rnaframework.com)
+ Summary: Converts a transcriptome-level BED file to genome-level
+
+ Usage:   transcriptome2genome -a annotation.bed input.bed
+
+ Options                                      Description
+ -o   or --output                             Output genome-level BED file (Default: <input>.genomeLevel.bed)
+ -a   or --annotation          <string>       Path to a reference annotation file in BED or GTF format
+ -b12 or --bed12                              Features will be reported in BED12 format
+                                              Note: by default features spanning multiple exons are reported as
+                                                    separate BED entries
+
+HELP
+
+}
