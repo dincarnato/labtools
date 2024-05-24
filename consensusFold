@@ -8,6 +8,7 @@ use lib "/path/to/RNAFramework/lib";
 
 use Core::Mathematics;
 use Core::Process::Queue;
+use Core::Utils;
 use Interface::ViennaRNA;
 use RF::Data::IO::XML;
 use Term::Progress;
@@ -16,18 +17,21 @@ $|++;
 
 my ($slope, $intercept, $output, $overwrite, 
     $help, $error, $progressBar, $queue,
-    $processors, @dirs, @files);
+    $processors, $maxBPdist, $temperature, @dirs, 
+    @files);
 
 do {
 
     local $SIG{__WARN__} = sub { };
 
-    GetOptions( "h|help"         => \$help,
-                "sl|slope=s"     => \$slope,
-                "in|intercept=s" => \$intercept,
-                "o|output=s"     => \$output,
-                "ow|overwrite"   => \$overwrite,
-                "p|processors=s" => \$processors ) or help(1);
+    GetOptions( "h|help"          => \$help,
+                "sl|slope=s"      => \$slope,
+                "in|intercept=s"  => \$intercept,
+                "md|maxBPdist=s"  => \$maxBPdist,
+                "t|temperature=s" => \$temperature,
+                "o|output=s"      => \$output,
+                "ow|overwrite"    => \$overwrite,
+                "p|processors=s"  => \$processors ) or help(1);
 
     @dirs = @ARGV;
 
@@ -38,6 +42,7 @@ help() if ($help);
 $processors ||= 1;
 $slope ||= 1.8;
 $intercept ||= -0.6;
+$temperature //= 37;
 $output ||= "consensusFold_out/";
 $output =~ s/\/?$/\//;
 
@@ -46,6 +51,8 @@ die "\n  [!] Error: At least 2 XML input directories needed\n\n" unless (@dirs);
 for (@dirs) { die "\n  [!] Error: Path to XML input directory \"" . $_ . "\" does not point to a folder\n\n" unless (-d $_); }
 die "\n  [!] Error: Slope must be numeric\n\n" if (!isnumeric($slope));
 die "\n  [!] Error: Intercept must be numeric\n\n" if (!isnumeric($intercept));
+die "\n  [!] Error: Max base-pair distance must be a positive INT > 3\n\n" if (defined $maxBPdist && (!isint($maxBPdist) || $maxBPdist < 4));
+die "\n  [!] Error: Temperature must be <= 100\n\n" if (!isnumeric($temperature) || $temperature > 100);
 
 print "\n[+] Making output directory...";
 
@@ -119,6 +126,7 @@ sub fold {
     $struct = $intf->alifold( \%seq,
                               { slope      => $slope,
                                 intercept  => $intercept,
+                                maxBPdist  => $maxBPdist,
                                 reactivity => \%reacts });
 
     $file =~ s/\.xml$/\.db/;
@@ -148,6 +156,8 @@ sub help {
  -p  or --processors      <int>        Number of processors to use (>=1, Default: 1)
  -sl or --slope           <float>      Sets the slope used with structural probing data restraints (Default: 1.8 [kcal/mol])
  -in or --intercept       <float>      Sets the intercept used with structural probing data restraints (Default: -0.6 [kcal/mol])
+ -md or --maxBPdist       <int>        Maximum allowed base-pair distance (>3, Default: no limit)
+ -t  or --temperature     <float>      Folding temperature, in Celsius degrees (<=100, Default: 37)
 
 HELP
 
