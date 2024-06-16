@@ -465,47 +465,50 @@ while (my $motif = $motifio->read()) {
 
             print STDERR "\n\n[!] Error: No sequences left for motif $id. Skipping...\n";
 
-            next MOTIF;
+            next MOTIF if ($iter == 1 || ($iter > 1 && !$lastCovarying));
 
         }
+        else {
 
-        print "\n[+] Writing matches to FASTA file";
+            print "\n[+] Writing matches to FASTA file";
 
-        open(my $wh, ">", $basename . ".fasta") or die "\n\n[!] Error: Unable to write sequences to FASTA file ($!)\n\n";
-        print $wh ">" . $_ . "\n" . $matches{$_} . "\n" for (keys %matches);
-        close($wh);
+            open(my $wh, ">", $basename . ".fasta") or die "\n\n[!] Error: Unable to write sequences to FASTA file ($!)\n\n";
+            print $wh ">" . $_ . "\n" . $matches{$_} . "\n" for (keys %matches);
+            close($wh);
 
-        print "\n[+] Aligning matches to covariance model...\n" .
-              "    Output from cmalign:\n\n";
+            print "\n[+] Aligning matches to covariance model...\n" .
+                "    Output from cmalign:\n\n";
 
-        $ret = `$path/cmalign --cpu $threads --noprob -o ${basename}_$iter.stockholm $basename.cm $basename.fasta`;
-        $ret =~ s/^/    /gm;
-        print $ret;
+            $ret = `$path/cmalign --cpu $threads --noprob -o ${basename}_$iter.stockholm $basename.cm $basename.fasta`;
+            $ret =~ s/^/    /gm;
+            print $ret;
 
-        if (!selectValidAln($basename . "_" . $iter, $nBasePairs)) {
+            if (!selectValidAln($basename . "_" . $iter, $nBasePairs)) {
 
-            print STDERR "\n\n[!] Error: No sequences left for motif $id in alignment. Skipping...\n\n";
+                print STDERR "\n\n[!] Error: No sequences left for motif $id in alignment. Skipping...\n\n";
 
-            next MOTIF;
-
-        }
-
-        if (!$skipRscape) {
-
-            my $covarying = getRscapeCovarying($basename . "_" . $iter);
-
-            if (($iter > 1 && $covarying < $lastCovarying) || (($iter > 1 || ($stopIfFirstZero && $iter == 1)) && !$covarying)) {
-
-                print STDERR "\n\n[!] Note: stopping at iteration " . $iter . " [covarying: " . $covarying . " - last: " . $lastCovarying . "]\n\n";
-                last ITER;
+                next MOTIF;
 
             }
 
-            $lastCovarying = $covarying;
+            if (!$skipRscape) {
+
+                my $covarying = getRscapeCovarying($basename . "_" . $iter);
+
+                if (($iter > 1 && $covarying < $lastCovarying) || (($iter > 1 || ($stopIfFirstZero && $iter == 1)) && !$covarying)) {
+
+                    print STDERR "\n\n[!] Note: stopping at iteration " . $iter . " [covarying: " . $covarying . " - last: " . $lastCovarying . "]\n\n";
+                    last ITER;
+
+                }
+
+                $lastCovarying = $covarying;
+
+            }
+
+            $lastIter = $iter;
 
         }
-
-        $lastIter = $iter;
 
     }
 

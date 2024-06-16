@@ -334,7 +334,7 @@ sub help {
  -lo  or --lenOutlier            <float>     After calculating the distribution of lengths of the sequences in 
                                              the alignment, and converting them into Z-scores, sequences with
                                              abs(Z-score) > this value are discarded as outliers (Default: 2)
-                                             Note: this option is overridden by -ft (or --fracTolerance)
+                                             Note: this option is overridden by -lt (or --lenFracTolerance)
  -go  or --gapOutlier            <float>     For each column of the alignment, if the fraction of sequences having
                                              a non-gap character is < than this fraction, those sequences are
                                              discarded as outliers (0-1, Default: 0 [no filter])
