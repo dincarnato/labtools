@@ -6,9 +6,15 @@ use Getopt::Long qw(:config no_ignore_case);
 
 use lib "/path/to/RNAFramework/lib";
 
-use Core::Mathematics;
+use Core::Mathematics qw(:all);
 use Core::Process::Queue;
 use Core::Utils;
+use Data::IO;
+use Graphics::Container;
+use Graphics::Object::Barplot;
+use Graphics::Object::Path;
+use Graphics::Object::RNAarcs;
+use Graphics::Object::Ruler;
 use Interface::ViennaRNA;
 use RF::Data::IO::XML;
 use Term::Progress;
@@ -17,8 +23,8 @@ $|++;
 
 my ($slope, $intercept, $output, $overwrite, 
     $help, $error, $progressBar, $queue,
-    $processors, $maxBPdist, $temperature, @dirs, 
-    @files);
+    $processors, $maxBPdist, $temperature, $genPlots,
+    @dirs, @files);
 
 do {
 
@@ -31,7 +37,8 @@ do {
                 "t|temperature=s" => \$temperature,
                 "o|output=s"      => \$output,
                 "ow|overwrite"    => \$overwrite,
-                "p|processors=s"  => \$processors ) or help(1);
+                "p|processors=s"  => \$processors,
+                "g|plot"          => \$genPlots ) or help(1);
 
     @dirs = @ARGV;
 
@@ -70,8 +77,10 @@ if (-e $output) {
 
 }
 
-mkpath($output, { mode  => 0755,
-                  error => \$error });
+mkpath($output . "structures", { mode  => 0755,
+                                 error => \$error });
+mkpath($output . "images", { mode  => 0755,
+                             error => \$error }) if ($genPlots);
 
 die "\n\n  [!] Error: Unable to create output directory (" . $error->[0]->{each(%{$error->[0]})} . ")\n\n" if (@{$error});
 
@@ -124,16 +133,78 @@ sub fold {
 
     $intf = Interface::ViennaRNA->new();
     $struct = $intf->alifold( \%seq,
-                              { slope      => $slope,
-                                intercept  => $intercept,
-                                maxBPdist  => $maxBPdist,
-                                reactivity => \%reacts });
+                              { slope             => $slope,
+                                intercept         => $intercept,
+                                maxBPdist         => $maxBPdist,
+                                reactivity        => \%reacts,
+                                temperature       => $temperature,
+                                partitionFunction => $genPlots ? 1 : 0 });
 
     $file =~ s/\.xml$/\.db/;
 
-    open(my $fh, ">", $output . "/" . $file) or die "[!] Failed to write to \"" . $output . "/" . $file . "\" (PID: $$, $!)\n";
+    open(my $fh, ">", $output . "/structures/" . $file) or die "[!] Failed to write to \"" . $output . "/" . $file . "\" (PID: $$, $!)\n";
     print $fh ">" . $id . "\n" . $struct->sequence() . "\n" . $struct->structure() . "\n";
     close($fh);
+
+    if ($genPlots) {
+
+        $file =~ s/\.db$/.svg/;
+
+        my ($ticksBy, $image, $io, $reactivity, 
+            $structure, $ruler, $pairProb, @reacts, 
+            @averageReact, @dotplot, %bpProb);
+        $ticksBy = max(1, round($struct->length() / 10));
+        $image = Graphics::Container->new( height  => abs(maprange(0, 1000, 1000, 500, min($struct->length(), 1000))), 
+                                           width   => 1000,
+                                           spacing => 0.02 );
+        $io = Data::IO->new( file    => $output . "/images/" . $file,
+                             mode    => "w",
+                             binmode => ":encoding(utf-8)" );
+        @reacts = map { my $i = $_; [ map { $reacts{$_}->[$i] } keys %reacts ] } 0 .. $struct->length() - 1;
+        @averageReact = map { isnumeric(@$_) ? min(mean(@$_), 2) : "NaN" } @reacts;
+        %bpProb = $struct->bpprobability();
+
+        foreach my $i (sort {$a <=> $b} keys %bpProb) {
+
+            foreach my $j (sort {$a <=> $b} keys %{$bpProb{$i}}) {
+
+                next if ($i > $j);
+
+                push(@dotplot, [$i, $j, $bpProb{$i}->{$j}]) if ($bpProb{$i}->{$j} >= 0.05);
+
+            }
+
+        }
+
+        $reactivity = Graphics::Object::Barplot->new( fontsize  => abs(maprange(0, 1000, -30, -10, min($struct->length(), 1000))),
+                                                      height    => 1,
+                                                      values    => \@averageReact,
+                                                      stdev     => [ map { isnumeric(@$_) ? stdev(@$_) : "NaN" } @reacts ],
+                                                      plotstdev => "up",
+                                                      yname     => "Reactivity",
+                                                      barfill   => [ map { $_ <= 0.4 ? "black" : ($_ < 0.7 ? "rgb(255,204,0)" : "rgb(153,25,23)") } @averageReact ],
+                                                      barstroke => [ map { $_ <= 0.4 ? "black" : ($_ < 0.7 ? "rgb(255,204,0)" : "rgb(153,25,23)") } @averageReact ] );
+        $structure = Graphics::Object::RNAarcs->new( height    => 2,
+                                                     length    => $struct->length(),
+                                                     flip      => "down",
+                                                     basepairs => [ $struct->basepairs() ] );
+        $ruler = Graphics::Object::Ruler->new( fontsize => abs(maprange(0, 1000, -30, -10, min($struct->length(), 1000))),
+                                               height   => 1,
+                                               range    => [ 0, $struct->length() ],
+                                               ticksby  => $ticksBy,
+                                               name     => "Position (nt)",
+                                               toend    => 1 );
+        $pairProb = Graphics::Object::RNAarcs->new( height    => 2,
+                                                    length    => $struct->length(),
+                                                    flip      => "down",
+                                                    basepairs => [ map { [$_->[0], $_->[1]] } @dotplot ],
+                                                    stroke    => [ map { $_->[2] < 0.1 ? "rgb(150,150,150)" : ($_->[2] < 0.4 ? "rgb(255,204,0)" : ($_->[2] < 0.7 ? "rgb(71,142,204)" : "rgb(81,183,71)")) } @dotplot ] );
+    
+        $image->addobjects($reactivity, $structure, $pairProb, 0.05, $ruler);
+        $io->write($image->xml());
+        $io->close();
+    
+    }
 
 }
 
@@ -158,6 +229,7 @@ sub help {
  -in or --intercept       <float>      Sets the intercept used with structural probing data restraints (Default: -0.6 [kcal/mol])
  -md or --maxBPdist       <int>        Maximum allowed base-pair distance (>3, Default: no limit)
  -t  or --temperature     <float>      Folding temperature, in Celsius degrees (<=100, Default: 37)
+ -g  or --plot                         Generate structure plots
 
 HELP
 
