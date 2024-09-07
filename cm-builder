@@ -24,8 +24,8 @@ my ($help, $motiffile, $iterations, $dbfile,
     $seqfile, $seq, $minlen, $rscape, $onlyStockholm,
     $stopIfFirstZero, $rscapeEvalue, $skipRscape, $useHelixAggregatedEvalue,
     $onGenome, $evalueDecrease, $useBitScore, $bitScore,
-    $bitScoreIncrease, $storeDb, $noiseEstimate, $originalBitScore,
-    $originalEvalue, $decoySize, $minDecoySize, %sequences);
+    $bitScoreIncrease, $noiseEstimate, $originalBitScore, $originalEvalue, 
+    $decoySize, $minDecoySize, $fast, %sequences);
 
 do {
 
@@ -37,6 +37,7 @@ do {
                 "d|db-file=s"                      => \$dbfile,
                 "i|iterations=i"                   => \$iterations,
                 "g|on-genome"                      => \$onGenome,
+                "F|fast"                           => \$fast,
                 "D|iterative-evalue-decrease=s"    => \$evalueDecrease,
                 "t|pos-tollerance=s"               => \$postollerance,
                 "q|min-query-cov=s"                => \$mincov,
@@ -58,7 +59,6 @@ do {
                 "B|use-bit-score"                  => \$useBitScore,
                 "T|bit-score=s"                    => \$bitScore,
                 "I|iterative-bit-score-increase=s" => \$bitScoreIncrease,
-                "O|store-db"                       => \$storeDb,
                 "N|noise-estimate"                 => \$noiseEstimate,
                 "ds|decoy-size=s"                  => \$decoySize,
                 "md|min-decoy-size=s"              => \$minDecoySize ) or help(1);
@@ -144,43 +144,15 @@ $seq = Data::IO::Sequence->new(file => $seqfile)->read();
 die "\n[!] Error: Unable to read sequence file\n\n" if (!defined $seq);
 
 print "\n[!] Note: Using bit scores. E-values will be ignored...\n" if ($useBitScore);
+print "\n[+] Importing sequence database...";
 
-if ($dbfile =~ m/\.storable$/) {
+$dbio = Data::IO::Sequence->new(file => $dbfile);
 
-    print "\n[+] Importing sequence database from storable file...";
-
-    my $sequences = retrieve($dbfile);
-    %sequences = %{$sequences};
-    $dbfile =~ s/\.storable$//;
-
-}
-else {
-
-    print "\n[+] Importing sequence database...";
-
-    $dbio = Data::IO::Sequence->new(file => $dbfile);
-
-    while(my $entry = $dbio->read()) { $sequences{$entry->id()} = $entry->sequence(); } # Runtime build index
-
-    store \%sequences, $dbfile . ".storable" if ($storeDb);
-
-}
+while(my $entry = $dbio->read()) { $sequences{$entry->id()} = $fast ? $entry->sequence() : $entry->length(); } # Runtime build index
 
 print " " . (keys %sequences) . " imported.";
 
 die "\n\n[!] Error: Sequence database is empty\n\n" if (!keys %sequences);
-
-if (!-e $dbfile) { # Only in case the file passed was a Storable
-
-    print "\n[+] FASTA database file \"" . $dbfile . "\" not found." .
-          "\n    Regenerating from Storable object...";
-
-    open(my $fh, ">", $dbfile) or die "\n\n[!] Error: Unable to write to database file (" . $! . ")\n\n";
-    select((select($fh), $|=1)[0]);
-    print $fh ">" . $_ . "\n" . $sequences{$_} . "\n" for (sort keys %sequences);
-    close($fh);
-
-}
 
 if ($noiseEstimate) {
 
@@ -193,7 +165,7 @@ if ($noiseEstimate) {
     foreach my $id (keys %sequences) {
 
         $n++;
-        print $wh ">" . $id . "\n" . rev($sequences{$id}) . "\n";
+        print $wh ">" . $id . "\n" . rev($fast ? $sequences{$id} : $dbio->read($id)->sequence()) . "\n";
 
         last if ($n == $max);
 
@@ -415,7 +387,7 @@ while (my $motif = $motifio->read()) {
 
             next if (($queryto - $queryfrom + 1) / ($mend - $mstart + 1) < $mincov);
             next if (!intersect([($mstart / $seq->length()) - $postollerance, ($mend / $seq->length()) + $postollerance],
-                                [($start / (length($sequences{$refid}) - 1)), ($end / (length($sequences{$refid}) - 1))]));
+                                [($start / (($fast ? length($sequences{$refid}) : $sequences{$refid}) - 1)), ($end / (($fast ? length($sequences{$refid}) : $sequences{$refid}) - 1))]));
 
             $matches{$refid} = [$start, $end, $revComp, $score] if (!exists $matches{$refid});
 
@@ -434,7 +406,7 @@ while (my $motif = $motifio->read()) {
 
         for (keys %matches) {
 
-            my $seqMatch = substr($sequences{$_}, $matches{$_}->[0], $matches{$_}->[1] - $matches{$_}->[0] + 1);
+            my $seqMatch = substr($fast ? $sequences{$_} : $dbio->read($_)->sequence(), $matches{$_}->[0], $matches{$_}->[1] - $matches{$_}->[0] + 1);
             $matches{$_} = $onGenome && $matches{$_}->[2] ? revcomp($seqMatch) : $seqMatch;
 
         }
@@ -718,9 +690,9 @@ sub help {
  Options                                             Description
  -m  or --motif-file                    <string>     Path to the RNA structure motif's file (in Vienna format)
  -d  or --db-file                       <string>     Path to the DB file of potentially related sequences (in FASTA format)
- -O  or --store-db                                   Database will be dumped to file in Perl's Storable format for faster loading on the next
-                                                     execution. File will be stored in the same path as the DB file, with appended ".storable"
-                                                     extension
+ -F  or --fast                                       DB will be kept in memory for faster processing
+                                                     Note: this might require a significant amount of RAM for large genomic databases
+                                                           (e.g., a DB of ~8,000 bacterial genomes will require approx. 17 Gb of RAM)
  -s  or --sequence-file                 <string>     Path to the original sequence file (from which the motif has been extracted, in FASTA format)
  -g  or --on-genome                                  Assumes that the covariance model is built by using a database of genomic sequences, hence
                                                      matches on both genomic strands must be retained
