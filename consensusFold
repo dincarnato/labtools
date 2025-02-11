@@ -10,21 +10,21 @@ use Core::Mathematics qw(:all);
 use Core::Process::Queue;
 use Core::Utils;
 use Data::IO;
-use Graphics::Container;
-use Graphics::Object::Barplot;
-use Graphics::Object::Path;
-use Graphics::Object::RNAarcs;
-use Graphics::Object::Ruler;
+use Graphics::Chart::Arcs;
+use Graphics::Chart::Area;
+use Graphics::Chart::Barplot;
+use Graphics::Image;
 use Interface::ViennaRNA;
 use RF::Data::IO::XML;
+use RF::Utils;
 use Term::Progress;
 
 $|++;
 
 my ($slope, $intercept, $output, $overwrite, 
-    $help, $error, $progressBar, $queue,
+    $help, $error, $progressBar, $queue, $R,
     $processors, $maxBPdist, $temperature, $genPlots,
-    @dirs, @files);
+    $tmpDir, $noStdev, @dirs, @files);
 
 do {
 
@@ -38,7 +38,9 @@ do {
                 "o|output=s"      => \$output,
                 "ow|overwrite"    => \$overwrite,
                 "p|processors=s"  => \$processors,
-                "g|plot"          => \$genPlots ) or help(1);
+                "g|plot"          => \$genPlots,
+                "R|R-path=s"      => \$R,
+                "ns|noStdev"      => \$noStdev ) or help(1);
 
     @dirs = @ARGV;
 
@@ -52,6 +54,8 @@ $intercept ||= -0.6;
 $temperature //= 37;
 $output ||= "consensusFold_out/";
 $output =~ s/\/?$/\//;
+$tmpDir = "${output}tmp/";
+$R = checkRinstall($R) if ($genPlots);
 
 die "\n  [!] Error: Number of processors must be a positive INT > 0\n\n" if (!isnumeric($processors) || !$processors);
 die "\n  [!] Error: At least 2 XML input directories needed\n\n" unless (@dirs);
@@ -79,8 +83,10 @@ if (-e $output) {
 
 mkpath($output . "structures", { mode  => 0755,
                                  error => \$error });
-mkpath($output . "images", { mode  => 0755,
-                             error => \$error }) if ($genPlots);
+mkpath($tmpDir, { mode  => 0755,
+                  error => \$error });
+mkpath($output . "plots", { mode  => 0755,
+                            error => \$error }) if ($genPlots);
 
 die "\n\n  [!] Error: Unable to create output directory (" . $error->[0]->{each(%{$error->[0]})} . ")\n\n" if (@{$error});
 
@@ -103,7 +109,7 @@ $progressBar = Term::Progress->new( max   => scalar(@files),
                                     width => 50 );
 $queue = Core::Process::Queue->new( processors   => $processors,
                                     parentOnExit => sub { $progressBar->update(1); },
-                                    stderr       => $output . "errors.out",
+                                    stderr       => $output . "error.out",
                                     verbosity    => -1 );
 $progressBar->init("");
 $queue->enqueue( command   => \&fold,
@@ -111,6 +117,11 @@ $queue->enqueue( command   => \&fold,
                  id        => $_ ) for (@files);
 $queue->start();
 $queue->waitall();
+
+rmtree($tmpDir);
+
+if (!-s $output . "error.out") { unlink($output . "error.out"); }
+else { print "\n\n  [!] Warning: Execution completed with error(s)/warning(s). Please check the \"${output}error.out\" file"; }
 
 print "\n\n[+] All done.\n\n";
 
@@ -131,7 +142,7 @@ sub fold {
 
     }
 
-    $intf = Interface::ViennaRNA->new();
+    $intf = Interface::ViennaRNA->new(tmpdir => $tmpDir);
     $struct = $intf->alifold( \%seq,
                               { slope             => $slope,
                                 intercept         => $intercept,
@@ -150,16 +161,14 @@ sub fold {
 
         $file =~ s/\.db$/.svg/;
 
-        my ($ticksBy, $image, $io, $reactivity, 
-            $structure, $ruler, $pairProb, @reacts, 
-            @averageReact, @dotplot, %bpProb);
-        $ticksBy = max(1, round($struct->length() / 10));
-        $image = Graphics::Container->new( height  => abs(maprange(0, 1000, 1000, 500, min($struct->length(), 1000))), 
-                                           width   => 1000,
-                                           spacing => 0.02 );
-        $io = Data::IO->new( file    => $output . "/images/" . $file,
-                             mode    => "w",
-                             binmode => ":encoding(utf-8)" );
+        my ($plot, $reactPlot, $probsPlot, $maxBp, 
+            @probsPlot, @data, @plots, @heights, @reacts, 
+            @averageReact, @dotplot, %bpProb, %dataLabels);
+        $plot = Graphics::Image->new( file   => "${output}plots/$id.pdf",
+                                      width  => 6 * 3,
+                                      height => 15,
+                                      R      => $R,
+                                      tmpdir => $tmpDir );
         @reacts = map { my $i = $_; [ map { $reacts{$_}->[$i] } keys %reacts ] } 0 .. $struct->length() - 1;
         @averageReact = map { isnumeric(@$_) ? min(mean(@$_), 2) : "NaN" } @reacts;
         %bpProb = $struct->bpprobability();
@@ -176,33 +185,64 @@ sub fold {
 
         }
 
-        $reactivity = Graphics::Object::Barplot->new( fontsize  => abs(maprange(0, 1000, -30, -10, min($struct->length(), 1000))),
-                                                      height    => 1,
-                                                      values    => \@averageReact,
-                                                      stdev     => [ map { isnumeric(@$_) ? stdev(@$_) : "NaN" } @reacts ],
-                                                      plotstdev => "up",
-                                                      yname     => "Reactivity",
-                                                      barfill   => [ map { $_ <= 0.4 ? "black" : ($_ < 0.7 ? "rgb(255,204,0)" : "rgb(153,25,23)") } @averageReact ],
-                                                      barstroke => [ map { $_ <= 0.4 ? "black" : ($_ < 0.7 ? "rgb(255,204,0)" : "rgb(153,25,23)") } @averageReact ] );
-        $structure = Graphics::Object::RNAarcs->new( height    => 2,
-                                                     length    => $struct->length(),
-                                                     flip      => "down",
-                                                     basepairs => [ $struct->basepairs() ] );
-        $ruler = Graphics::Object::Ruler->new( fontsize => abs(maprange(0, 1000, -30, -10, min($struct->length(), 1000))),
-                                               height   => 1,
-                                               range    => [ 0, $struct->length() ],
-                                               ticksby  => $ticksBy,
-                                               name     => "Position (nt)",
-                                               toend    => 1 );
-        $pairProb = Graphics::Object::RNAarcs->new( height    => 2,
-                                                    length    => $struct->length(),
-                                                    flip      => "down",
-                                                    basepairs => [ map { [$_->[0], $_->[1]] } @dotplot ],
-                                                    stroke    => [ map { $_->[2] < 0.1 ? "rgb(150,150,150)" : ($_->[2] < 0.4 ? "rgb(255,204,0)" : ($_->[2] < 0.7 ? "rgb(71,142,204)" : "rgb(81,183,71)")) } @dotplot ] );
-    
-        $image->addobjects($reactivity, $structure, $pairProb, 0.05, $ruler);
-        $io->write($image->xml());
-        $io->close();
+        %dataLabels = ("Reactivity" => [ map { $_ <= 0.4 || isnan($_) ? "0-0.4" : ($_ < 0.7 ? "0.4-0.7" : "0.7+") } @averageReact ]);
+            
+        if (@reacts > 1) { $dataLabels{"sd"} = [ map { isnumeric(@$_) ? stdev(@$_) : "NaN" } @reacts ]; }
+
+        $reactPlot = Graphics::Chart::Barplot->new( data            => \@averageReact,
+                                                    dataLabels      => \%dataLabels,
+                                                    fill            => "Reactivity",
+                                                    legendTitle     => "Reactivity",
+                                                    legendColors    => { "0-0.4"   => "#000000",
+                                                                         "0.4-0.7" => "#fdb934",
+                                                                         "0.7+"    => "#aa1a1f" },
+                                                    legendKeyWidth  => 14,
+                                                    legendKeyHeight => 14,
+                                                    legendTextSize  => 12,
+                                                    legendTitleSize => 14,
+                                                    axisTitleSize   => 14,
+                                                    labelTextSize   => 12,
+                                                    legendSort      => [ "0.7+", "0.4-0.7", "0-0.4" ],
+                                                    yTitle          => "Reactivity",
+                                                    yLimit          => [0, 2],
+                                                    xLimit          => [0, @averageReact + 1],
+                                                    stdev           => @reacts > 1 && !$noStdev ? "sd" : undef );
+
+        push(@plots, $reactPlot);
+        push(@heights, 1);
+
+        @data = map { [ @$_[0, 1] ] } @dotplot;
+        $maxBp = max(map { abs(diff(@$_)) } @data);
+        $probsPlot = Graphics::Chart::Arcs->new( data            => \@data,
+                                                 dataLabels      => { "prob" => [ map { $_->[2] < 0.1 ? "5-10%" : ($_->[2] < 0.4 ? "10-40%" : ($_->[2] < 0.7 ? "40-70%" : "70-100%")) } @dotplot ] },
+                                                 flip            => "down",
+                                                 fill            => "prob",
+                                                 legendKeyWidth  => 14,
+                                                 legendKeyHeight => 4,
+                                                 legendColors    => { "5-10%"   => "#979797",
+                                                                     "10-40%"  => "#ffcc07",
+                                                                     "40-70%"  => "#478ecc",
+                                                                     "70-100%" => "#58b14a" },
+                                                 legendSort      => [ "5-10%", "10-40%", "40-70%", "70-100%" ],
+                                                 xLimit          => [0, @averageReact + 1],
+                                                 lineThickness   => 0.2,
+                                                 legendTitle     => "Probability",
+                                                 legend          => 1,
+                                                 background      => 0,
+                                                 grid            => 0,
+                                                 xTicks          => 0,
+                                                 yTicks          => 0,
+                                                 xLabels         => 0,
+                                                 yLabels         => 0,
+                                                 legendTextSize  => 12,
+                                                 legendTitleSize => 14,
+                                                 axisTitleSize   => 14,
+                                                 labelTextSize   => 12 );
+
+        push(@plots, $probsPlot);
+        push(@heights, $maxBp / @averageReact * 1.4);
+
+        $plot->plot([ map { [$_] } @plots ], { heights => \@heights});
     
     }
 
@@ -230,6 +270,7 @@ sub help {
  -md or --maxBPdist       <int>        Maximum allowed base-pair distance (>3, Default: no limit)
  -t  or --temperature     <float>      Folding temperature, in Celsius degrees (<=100, Default: 37)
  -g  or --plot                         Generate structure plots
+ -ns or --noStdev                      Disables plotting of error bars in reactivity plots
 
 HELP
 
