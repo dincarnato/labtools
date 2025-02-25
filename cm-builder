@@ -413,31 +413,33 @@ while (my $motif = $motifio->read()) {
 
         print " " . keys(%matches) . " matches found.";
 
+        if (keys %matches) {
+
+            print "\n[+] Removing duplicate sequences...";
+
+            foreach my $refid (keys %matches) {
+
+                delete($matches{$refid}) if (exists $seen{$matches{$refid}});
+
+                $seen{$matches{$refid}} = 1;
+
+            }
+
+            print " " . keys(%matches) . " matches left.";
+
+        }
+
         if (!keys %matches) {
 
             print STDERR "\n\n[!] Error: No sequences left for motif $id. Skipping...\n";
 
-            next MOTIF;
+            if ($iter == 1 || ($iter > 1 && !$lastCovarying)) { next MOTIF; }
+            else {
 
-        }
+                print STDERR "[!] Note: stopping at iteration " . $iter . " [last covarying: " . $lastCovarying . "]\n";
+                last ITER;
 
-        print "\n[+] Removing duplicate sequences...";
-
-        foreach my $refid (keys %matches) {
-
-            delete($matches{$refid}) if (exists $seen{$matches{$refid}});
-
-            $seen{$matches{$refid}} = 1;
-
-        }
-
-        print " " . keys(%matches) . " matches left.";
-
-        if (!keys %matches) {
-
-            print STDERR "\n\n[!] Error: No sequences left for motif $id. Skipping...\n";
-
-            next MOTIF if ($iter == 1 || ($iter > 1 && !$lastCovarying));
+            }
 
         }
         else {
@@ -661,8 +663,9 @@ sub getRscapeCovarying {
     print "\n[+] Calculating covarying base-pairs...\n" .
           "    Output from R-scape:\n\n";
 
-    my ($ret, $cov);
-    $ret = `$rscape -s -E $rscapeEvalue --outdir $tmpdir --lancaster $basename.stockholm`;
+    my ($ret, $cov, $Eparam);
+    $Eparam = $useHelixAggregatedEvalue ? "--E_hlx" : "-E";
+    $ret = `$rscape -s $Eparam $rscapeEvalue --outdir $tmpdir --lancaster $basename.stockholm`;
     $cov = 0;
 
     if ($useHelixAggregatedEvalue) { while($ret =~ m/^# aggregated LANCASTER.+?\*/mg) { $cov++; } }
