@@ -146,7 +146,7 @@ sub fold {
     $struct = $intf->alifold( \%seq,
                               { slope             => $slope,
                                 intercept         => $intercept,
-                                maxBPdist         => $maxBPdist,
+                                maxBPspan         => $maxBPdist,
                                 reactivity        => \%reacts,
                                 temperature       => $temperature,
                                 partitionFunction => $genPlots ? 1 : 0 });
