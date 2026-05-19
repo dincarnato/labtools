@@ -1,0 +1,292 @@
+#!/usr/bin/env perl
+
+##
+# splitFastqByBarcode
+#
+# Splits an input FASTQ file by RT barcode.
+# The barcode must be located at the 5' end of R1.
+# The sample sheet must contain: barcode<TAB>sample name
+##
+
+use strict;
+use FindBin qw($Bin);
+use Getopt::Long qw(:config no_ignore_case);
+
+use lib $Bin . "/lib";
+
+use Core::Utils;
+use Data::Sequence::Utils;
+use Term::Table;
+
+$|++;
+
+my ($help, $sampleSheet, $fastqFiles, $perfect, 
+    $fh2, $stats, $bcodeLen, $output, $overwrite,
+    $unassigned, $saveUnassigned, @fastqFiles, 
+    %barcodes, %samples, %stats);
+
+do {
+
+    local $SIG{__WARN__} = sub { };
+
+    GetOptions( "h|help"           => \$help,
+                "s|sampleSheet=s"  => \$sampleSheet,
+                "f|fastq=s"        => \$fastqFiles,
+                "p|perfect"        => \$perfect,
+                "o|outputDir=s"    => \$output,
+                "ow|overwrite"     => \$overwrite,
+                "u|saveUnassigned" => \$saveUnassigned ) or help(1);
+
+};
+
+help() if ($help);
+
+$output ||= "splitFastq/";
+$output =~ s/\/?$/\//;
+@fastqFiles = split /,/, $fastqFiles;
+
+die "\n[!] Error: No sample sheet provided\n\n" if (!defined $sampleSheet);
+die "\n[!] Error: Specified sample sheet does not exist\n\n" if (!-e $sampleSheet);
+die "\n[!] Error: No FASTQ file provided\n\n" if (!@fastqFiles);
+die "\n[!] Error: More than 2 FASTQ files provided\n\n" if (@fastqFiles > 2);
+for (@fastqFiles) { die "\n[!] Error: Specified FASTQ file \"$_\" does not exist\n\n" if (!-e $_); }
+
+open(my $fh, "<", $sampleSheet) or die "\n[!] Error: Unable to open sample sheet ($!)\n\n";
+while(<$fh>) {
+
+    chomp;
+
+    next if (substr($_, 0, 1) eq "#" || $_ eq "");
+
+    my @bcode = split /\t/;
+
+    if (@bcode < 2) {
+
+        warn "\n[!] Warning: Row has less than 2 fields (\"$_\")";
+
+        next;
+
+    }
+    
+    if (!isdna($bcode[0])) {
+
+        warn "\n[!] Warning: Not a valid DNA barcode sequence (\"$bcode[0]\")";
+
+        next;
+
+    }
+
+    # Remove potentially problematic characters
+    $bcode[1] =~ s/[^\w_\-\.]/_/g;
+
+    die "\n[!] Error: Duplicate sample id (\"$bcode[1]\")\n\n" if (exists $samples{$bcode[1]});
+
+    if (!defined $bcodeLen) { $bcodeLen = length($bcode[0]); }
+    else { die "\n[!] Error: Barcodes cannot have different lengths\n\n" if ($bcodeLen != length($bcode[0])); }
+
+    for (bcodeVariants($bcode[0])) { $barcodes{$_} = $bcode[1]; }
+    $samples{$bcode[1]} = 1;
+
+}
+close($fh);
+
+if (-e $output) {
+
+    if ($overwrite) {
+
+        my $error = rmtree($output);
+
+        die "\n[!] Error: $error\n\n" if ($error);
+
+    }
+    else { die "\n[!] Error: Output directory already exists." .
+               "\n    Please use -ow (or --overwrite) to overwrite output directory\n\n"; }
+
+}
+
+if (my $error = mktree($output, "755")) { die "\n[!] Error: Unable to create output directory ($error)\n\n"; }
+
+foreach my $sample (keys %samples) {
+
+    open(my $wh1, "|-", "gzip -c > ${output}${sample}" . (@fastqFiles == 2 ? "_R1" : "") . ".fastq.gz") or die "\n[!] Error: Unable to write sample \"$sample\" fastq file ($!)\n\n";
+    $samples{$sample} = { r1 => $wh1 };
+
+    if (@fastqFiles == 2) {
+
+        open(my $wh2, "|-", "gzip -c > ${output}${sample}_R2.fastq.gz") or die "\n[!] Error: Unable to write sample \"$sample\" fastq file ($!)\n\n";
+        $samples{$sample}->{r2} = $wh2;
+
+    }
+
+}
+
+if ($saveUnassigned) {
+
+    open(my $wh1, "|-", "gzip -c > ${output}Unassigned" . (@fastqFiles == 2 ? "_R1" : "") . ".fastq.gz") or die "\n[!] Error: Unable to write unassigne fastq file ($!)\n\n";
+    $samples{"__UNASSIGNED__"} = { r1 => $wh1 };
+
+    if (@fastqFiles == 2) {
+
+        open(my $wh2, "|-", "gzip -c > ${output}Unassigne_R2.fastq.gz") or die "\n[!] Error: Unable to write unassigne fastq file ($!)\n\n";
+        $samples{"__UNASSIGNED__"}->{r2} = $wh2;
+
+    }
+
+}
+
+open($fh, "-|", (substr($fastqFiles[0], -3) eq ".gz" ? "zcat" : "cat") . " $fastqFiles[0]") or die "\n[!] Error: Unable to read FASTQ file \"$fastqFiles[0]\" ($!)\n\n";
+if (@fastqFiles == 2) { open($fh2, "-|", (substr($fastqFiles[1], -3) eq ".gz" ? "zcat" : "cat") . " $fastqFiles[1]") or die "\n[!] Error: Unable to read FASTQ file \"$fastqFiles[1]\" ($!)\n\n"; }
+
+while(!eof($fh)) {
+
+    my ($id, $seq, $qual, $bcode, $sample);
+    chomp($id = <$fh>);
+    chomp($seq = <$fh>);
+    <$fh>;
+    chomp($qual = <$fh>);
+
+    $bcode = substr($seq, 0, $bcodeLen);
+    $sample = $barcodes{$bcode};
+
+    if (defined $sample) {
+
+        $stats{$sample}++;
+
+        my $wh = $samples{$sample}->{r1};
+        print $wh join("\n", $id . "+$bcode", substr($seq, $bcodeLen + 1), "+", substr($qual, $bcodeLen + 1)) . "\n";
+
+        if (@fastqFiles == 2) {
+
+            my ($id2, $seq2, $qual2, $wh2);
+            chomp($id2 = <$fh2>);
+            chomp($seq2 = <$fh2>);
+            <$fh2>;
+            chomp($qual2 = <$fh2>);
+
+            $wh2 = $samples{$sample}->{r2};
+            print $wh2 join("\n", $id2 . "+$bcode", $seq2, "+", $qual2) . "\n";
+
+        }
+
+    }
+    else { 
+        
+        $unassigned++; 
+
+        if ($saveUnassigned) {
+
+            my $wh = $samples{"__UNASSIGNED__"}->{r1};
+            print $wh join("\n", $id . "+$bcode", substr($seq, $bcodeLen + 1), "+", substr($qual, $bcodeLen + 1)) . "\n";
+
+            if (@fastqFiles == 2) {
+
+                my ($id2, $seq2, $qual2, $wh2);
+                chomp($id2 = <$fh2>);
+                chomp($seq2 = <$fh2>);
+                <$fh2>;
+                chomp($qual2 = <$fh2>);
+
+                $wh2 = $samples{"__UNASSIGNED__"}->{r2};
+                print $wh2 join("\n", $id2 . "+$bcode", $seq2, "+", $qual2) . "\n";
+
+            }
+
+        }
+
+    }
+
+}
+
+foreach my $sample (keys %samples) { 
+    
+    close($samples{$sample}->{r1});
+    close($samples{$sample}->{r2}) if (@fastqFiles == 2);
+    
+}
+
+$stats = Term::Table->new(indent => 2);
+$stats->head("Sample", "# of reads");
+$stats->row($_, $stats{$_}) for (sort keys %stats);
+
+if ($unassigned) {
+
+    $stats->blank() if (keys %stats);
+    $stats->row("Unassigned", $unassigned);
+
+}
+else {
+
+    if ($saveUnassigned) {
+
+        if (@fastqFiles == 2) { unlink("${output}Unassigned_R$_.fastq.gz") for (1, 2); }
+        else { unlink("${output}Unassigned.fastq.gz"); }
+
+    }
+
+}
+
+print "\n";
+$stats->print();
+print "\n\n";
+
+sub bcodeVariants {
+
+    my ($seq) = @_;
+    my @bases = qw(A C G N T);
+    my @variants;
+
+    return($seq) if ($perfect);
+
+    # include original (distance 0)
+    push @variants, $seq;
+
+    my @chars = split //, $seq;
+
+    for my $i (0 .. $#chars) {
+
+        for my $b (@bases) {
+
+            next if $b eq $chars[$i];  # skip same base
+
+            my @mut = @chars;
+            $mut[$i] = $b;
+
+            push @variants, join("", @mut);
+
+        }
+
+    }
+
+    return(sort @variants);
+
+}
+
+sub help {
+
+    print "\n  [!] Error: Invalid option. Please check the help\n" if ($_[0]);
+
+    die <<HELP;
+
+ splitFastqByBarcode (using RNA Framework v$Core::Utils::VERSION)
+
+ Author:  Danny Incarnato (dincarnato[at]rnaframework.com)
+ Summary: Splits an input FASTQ file by RT barcode.
+          The barcode must be located at the 5' end of R1.
+          The sample sheet must contain: barcode<TAB>sample name
+
+ Usage:   splitFastqByBarcode [Options] -s samplesheet.tsv -f file.fastq.gz             # Single read
+          splitFastqByBarcode [Options] -s samplesheet.tsv -f R1.fastq.gz,R2.fastq.gz   # Paired end
+
+ Options                                            Description
+ -o  or --outputDir         <string>                Output directory (Default: splitFastq/)
+ -ow or --overwrite                                 Overwrites output directory (if the specified path already exists)
+ -f  or --fastq             <string>[,<string>]     Path to the FASTQ file to be split (mandatory). For paired-end 
+                                                    experiments, both mates can be passed as a comma-separated list
+ -s  or --sampleSheet       <string>                Path to the sample sheet (mandatory)
+ -p  or --perfect                                   Requires perfect match to the barcode (default is to allow 1 mismatch)
+ -u  or --saveUnassigned                            Saves unassigned reads (default is to discard them)
+
+HELP
+
+}
+

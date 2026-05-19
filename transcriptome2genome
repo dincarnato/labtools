@@ -62,13 +62,19 @@ while(<$fh>) {
 
         my (@starts, @lens);
         $id = $row[3];
-        @lens = split /,/, $row[10];
-        @starts = split /,/, $row[11];
+        
+        if (@row == 12) {
+
+            @lens = split /,/, $row[10];
+            @starts = split /,/, $row[11];
+
+        }
+
         $annotation{$id} = { strand => @row >= 6 ? $row[5] : "+",
                              start  => $row[1],
                              chr    => $row[0],
-                             length => sum(@lens),
-                             exons  => [ map { [$starts[$_], ($starts[$_] + $lens[$_] - 1)] } 0 .. $#starts ] };
+                             length => @lens ? sum(@lens) : $row[2] - $row[1],
+                             exons  => @starts ? [ map { [$starts[$_], ($starts[$_] + $lens[$_] - 1)] } 0 .. $#starts ] : [[0, ($row[2] - $row[1] - 1)]] };
 
     }
 
