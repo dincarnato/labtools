@@ -22,8 +22,8 @@ $|++;
 
 my ($help, $sampleSheet, $fastqFiles, $perfect, 
     $fh2, $stats, $bcodeLen, $output, $overwrite,
-    $unassigned, $saveUnassigned, @fastqFiles, 
-    %barcodes, %samples, %stats);
+    $unassigned, $saveUnassigned, $line, 
+    @fastqFiles, %barcodes, %samples, %stats);
 
 do {
 
@@ -43,6 +43,7 @@ help() if ($help);
 
 $output ||= "splitFastq/";
 $output =~ s/\/?$/\//;
+$line = 0;
 @fastqFiles = split /,/, $fastqFiles;
 
 die "\n[!] Error: No sample sheet provided\n\n" if (!defined $sampleSheet);
@@ -54,6 +55,8 @@ for (@fastqFiles) { die "\n[!] Error: Specified FASTQ file \"$_\" does not exist
 open(my $fh, "<", $sampleSheet) or die "\n[!] Error: Unable to open sample sheet ($!)\n\n";
 while(<$fh>) {
 
+    $line++;
+
     chomp;
 
     next if (substr($_, 0, 1) eq "#" || $_ eq "");
@@ -62,7 +65,7 @@ while(<$fh>) {
 
     if (@bcode < 2) {
 
-        warn "\n[!] Warning: Row has less than 2 fields (\"$_\")";
+        warn "\n[!] Warning: Sample sheet line $line has < 2 fields (\"$_\")";
 
         next;
 
@@ -70,7 +73,7 @@ while(<$fh>) {
     
     if (!isdna($bcode[0])) {
 
-        warn "\n[!] Warning: Not a valid DNA barcode sequence (\"$bcode[0]\")";
+        warn "\n[!] Warning: Not a valid DNA barcode sequence at line $line (\"$bcode[0]\")";
 
         next;
 
@@ -79,10 +82,16 @@ while(<$fh>) {
     # Remove potentially problematic characters
     $bcode[1] =~ s/[^\w_\-\.]/_/g;
 
-    die "\n[!] Error: Duplicate sample id (\"$bcode[1]\")\n\n" if (exists $samples{$bcode[1]});
+    die "\n[!] Error: Duplicate sample ID at line $line (\"$bcode[1]\")\n\n" if (exists $samples{$bcode[1]});
 
     if (!defined $bcodeLen) { $bcodeLen = length($bcode[0]); }
-    else { die "\n[!] Error: Barcodes cannot have different lengths\n\n" if ($bcodeLen != length($bcode[0])); }
+    else { 
+        
+        my $len = length($bcode[0]);
+
+        die "\n[!] Error: Barcodes with different length at line $line (expected: $bcodeLen, found: $len)\n\n" if ($bcodeLen != $len); 
+        
+    }
 
     for (bcodeVariants($bcode[0])) { $barcodes{$_} = $bcode[1]; }
     $samples{$bcode[1]} = 1;
@@ -218,8 +227,12 @@ else {
 
     if ($saveUnassigned) {
 
-        if (@fastqFiles == 2) { unlink("${output}Unassigned_R$_.fastq.gz") for (1, 2); }
-        else { unlink("${output}Unassigned.fastq.gz"); }
+        if (@fastqFiles == 2) { 
+            
+            for (1, 2) { unlink("${output}Unassigned_R$_.fastq.gz") if (-s "${output}Unassigned_R$_.fastq.gz" <= 20); } 
+            
+        }
+        else { unlink("${output}Unassigned.fastq.gz") if (-s "${output}Unassigned.fastq.gz" <= 20); }
 
     }
 
