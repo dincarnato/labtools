@@ -199,6 +199,14 @@ while (my $motif = $motifio->read()) {
     $mstart = index(rna2dna($seq->sequence()), $seqnogaps, 0);
     $mend = $mstart + $motiflen - 1;
 
+    if (!$nBasePairs) {
+
+        print STDERR "\n\n[!] Motif $id has no base-pairs. Skipping...\n";
+
+        next MOTIF;
+
+    }
+
     print "\n[+] Looking for motif position in sequence...";
 
     if ($mstart == -1) {
@@ -710,7 +718,7 @@ sub help {
                                                      of significantly covarying base-pairs (requires R-scape v2.0.0.q)
  -i  or --iterations                    <int>        Number of iterations to perform to refine the covariance model (Default: 3)
  -f  or --stop-if-first-zero                         If at the first iteration 0 covarying base-pairs are found, it stops immediately instead of going
-						                             to the next iteration
+                                                     to the next iteration
  -r  or --skip-rscape                                Skips alignment evaluation step with R-scape
  -p  or --press                                      Presses covariance model (for searching with cmscan)
  -S  or --only-stockholm                             Does not generate final covariance model, only Stockholm alignment (implies -k)
