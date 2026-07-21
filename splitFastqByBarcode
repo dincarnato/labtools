@@ -148,11 +148,21 @@ if (@fastqFiles == 2) { open($fh2, "-|", (substr($fastqFiles[1], -3) eq ".gz" ? 
 
 while(!eof($fh)) {
 
-    my ($id, $seq, $qual, $bcode, $sample);
+    my ($id, $seq, $qual, $bcode, $sample,
+        $id2, $seq2, $qual2);
     chomp($id = <$fh>);
     chomp($seq = <$fh>);
     <$fh>;
     chomp($qual = <$fh>);
+
+    if (@fastqFiles == 2) {
+        
+        chomp($id2 = <$fh2>);
+        chomp($seq2 = <$fh2>);
+        <$fh2>;
+        chomp($qual2 = <$fh2>);
+
+    }
 
     $bcode = substr($seq, 0, $bcodeLen);
     $sample = $barcodes{$bcode};
@@ -166,13 +176,7 @@ while(!eof($fh)) {
 
         if (@fastqFiles == 2) {
 
-            my ($id2, $seq2, $qual2, $wh2);
-            chomp($id2 = <$fh2>);
-            chomp($seq2 = <$fh2>);
-            <$fh2>;
-            chomp($qual2 = <$fh2>);
-
-            $wh2 = $samples{$sample}->{r2};
+            my $wh2 = $samples{$sample}->{r2};
             print $wh2 join("\n", $id2 . "+$bcode", $seq2, "+", $qual2) . "\n";
 
         }
@@ -189,13 +193,7 @@ while(!eof($fh)) {
 
             if (@fastqFiles == 2) {
 
-                my ($id2, $seq2, $qual2, $wh2);
-                chomp($id2 = <$fh2>);
-                chomp($seq2 = <$fh2>);
-                <$fh2>;
-                chomp($qual2 = <$fh2>);
-
-                $wh2 = $samples{"__UNASSIGNED__"}->{r2};
+                my $wh2 = $samples{"__UNASSIGNED__"}->{r2};
                 print $wh2 join("\n", $id2 . "+$bcode", $seq2, "+", $qual2) . "\n";
 
             }
