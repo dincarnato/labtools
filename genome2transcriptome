@@ -1,0 +1,593 @@
+#!/usr/bin/env perl
+
+##
+# genome2transcriptome
+#
+# Summary:  Given a GTF gene annotation and a BED file of features in genomic
+#           coordinates, converts the features into transcript (spliced)
+#           coordinates
+#
+# Input(s): GTF/BED gene annotation, BED file of features (genomic coordinates)
+# Outputs:  BED6-like file, with features remapped to transcript coordinates
+#           (one line per feature/transcript pair), plus the original genomic
+#           locus and a set of QC fields
+#
+##
+
+use strict;
+use File::Path qw(mkpath rmtree);
+use FindBin qw($Bin);
+use Getopt::Long qw(:config no_ignore_case);
+
+use lib $Bin . "/lib";
+
+use Core::Mathematics qw(:all);
+use Core::Utils;
+
+$|++;
+
+my ($help, $output, $overwrite, $annoFile, $isGTF,
+    $bedFile, $GTFattrib, $gtfFeature,
+    $sameStrand, $fullOnly, $minOverlap,
+    $error, $nFeatures, $nMapped, $nSkipped, $tmpFile,
+    $nAnnoSkipped, $nAnnoDup, $nAnnoUnstranded, $nUnstranded,
+    $sweepChrom, $sweepPtr, $sweepLast, @sweepCache,
+    %transcripts, %byChrom, %feature, %pieces, %seenAnno);
+
+do {
+
+    local $SIG{__WARN__} = sub { };
+
+    GetOptions( "h|help"                => \$help,
+                "o|output=s"            => \$output,
+                "ow|overwrite"          => \$overwrite,
+                "af|annoFile=s"         => \$annoFile,
+                "ga|GTFattrib=s"        => \$GTFattrib,
+                "gf|gtfFeature=s"       => \$gtfFeature,
+                "ss|sameStrand"         => \$sameStrand,
+                "fo|fullyOverlapping"   => \$fullOnly,
+                "mo|minOverlap=s"       => \$minOverlap ) or help(1);
+
+    $bedFile = $ARGV[0];
+
+};
+
+help() if ($help);
+
+$GTFattrib ||= "transcript_id";
+$gtfFeature ||= "exon";
+$nAnnoSkipped = $nAnnoDup = $nAnnoUnstranded = 0;
+$nFeatures = $nMapped = $nSkipped = $nUnstranded = 0;
+$tmpFile = randalphanum(12);
+
+if (!$output) {
+
+    $output = $bedFile;
+    $output =~ s/\.bed$//i;
+    $output .= ".transcriptomeLevel.bed";
+
+}
+
+$SIG{__DIE__} = \&cleanup;
+
+die "\n[!] Error: No path provided to BED feature file\n\n" if (!defined $bedFile);
+die "\n[!] Error: Provided path to BED feature file does not exist\n\n" if (!-e $bedFile);
+die "\n[!] Error: No path provided to GTF gene annotation file\n\n" if (!defined $annoFile);
+die "\n[!] Error: Provided path to GTF gene annotation file does not exist\n\n" if (!-e $annoFile);
+die "\n[!] Error: No GTF attribute specified\n\n" if (!defined $GTFattrib);
+die "\n[!] Error: Minimum overlap fraction must be comprised between 0 and 1\n\n" if (defined $minOverlap &&
+                                                                                        (!isnumeric($minOverlap) || !inrange($minOverlap, [0, 1])));
+$isGTF = 1 if ($annoFile !~ /\.bed$/i);
+
+print "\n[+] Importing gene annotation...";
+
+open(my $fh, "<", $annoFile) or die "\n\n[!] Error: Unable to read from annotation file ($!)\n\n";
+
+while(<$fh>) {
+
+    chomp($_);
+
+    next if (/^\#/ || $_ eq "");
+
+    my ($id, $strand, $blocks, @row);
+    @row = split /\t/;
+
+    if ($isGTF) {
+
+        next if (@row < 9);
+        next if ($row[2] ne $gtfFeature);
+
+        ($id) = $row[8] =~ m/$GTFattrib "(.+?)"/;
+
+        next if (!defined $id || $id eq "");
+
+        $strand = $row[6];
+
+        # GTF is 1-based and fully closed, BED is 0-based and half-open. Each GTF row
+        # contributes a single block, and the rows sharing an ID are merged downstream
+        $blocks = [[$row[3] - 1, $row[4]]];
+
+    }
+    else {
+
+        next if (@row < 4);
+
+        $id = $row[3];
+
+        next if (!defined $id || $id eq "" || $id eq ".");
+
+        if (!isint($row[1]) || !isint($row[2]) || $row[2] <= $row[1]) {
+
+            warn "\n\n[!] Warning: Skipping malformed annotation entry (" . join("\t", @row[0..2]) . ")\n";
+            $nAnnoSkipped++;
+
+            next;
+
+        }
+
+        $strand = @row > 5 && $row[5] =~ m/^[+-]$/ ? $row[5] : undef;
+
+        if (!defined $strand) {
+
+            $strand = "+";
+            $nAnnoUnstranded++;
+
+        }
+
+        $blocks = bedToBlocks(@row);
+
+        if (!defined $blocks) {
+
+            warn "\n\n[!] Warning: Skipping BED entry with inconsistent block definition ($id)\n";
+            $nAnnoSkipped++;
+
+            next;
+
+        }
+
+    }
+
+    # Unlike a GTF, where the exons of a transcript are spread across multiple rows, each
+    # BED record is a complete transcript, so a repeated name would silently merge the
+    # blocks of two unrelated entries into a single chimeric transcript
+    if (!$isGTF) {
+
+        if ($seenAnno{$id}) {
+
+            $nAnnoDup++;
+
+            next;
+
+        }
+
+        $seenAnno{$id} = 1;
+
+    }
+
+    # Block start, block end (both 0-based, inclusive)
+    foreach my $block (@{$blocks}) { push(@{$transcripts{$id}->{exons}}, [$block->[0], $block->[1] - 1]); }
+
+    $transcripts{$id}->{strand} = $strand;
+    $transcripts{$id}->{chrom} = $row[0];
+
+}
+
+close($fh);
+
+if (my $imported = scalar(keys %transcripts)) { print " $imported transcripts imported."; }
+elsif ($isGTF) { die " 0 transcripts imported.\n\n[!] Error: No transcript imported. Please check --GTFattrib and --gtfFeature values and try again\n\n"; }
+else { die " 0 transcripts imported.\n\n[!] Error: No transcript imported. Please check that the annotation is a valid BED file with transcript names in column 4\n\n"; }
+
+print "\n[!] Warning: $nAnnoSkipped malformed annotation entries were skipped." if ($nAnnoSkipped);
+print "\n[!] Warning: $nAnnoDup BED entries were skipped, as their name (column 4) had already been seen." .
+      "\n             Transcript names must be unique in a BED annotation." if ($nAnnoDup);
+print "\n[i] $nAnnoUnstranded annotation entries had no strand information (column 6) and were assumed to be on the plus strand." if ($nAnnoUnstranded);
+
+print "\n[+] Building genome-to-transcript coordinate maps...";
+
+foreach my $id (keys %transcripts) {
+
+    my ($cumulative, @exons);
+    $cumulative = 0;
+    @exons = sort { $a->[0] <=> $b->[0] ||
+                    $a->[1] <=> $b->[1] } @{$transcripts{$id}->{exons}};
+
+    foreach my $exon (@exons) {
+
+        # Skips duplicated exon entries (some GTFs list the same exon twice),
+        # as these would inflate the transcript's length
+        next if (exists $transcripts{$id}->{map} &&
+                 $transcripts{$id}->{map}->[-1]->[0] == $exon->[0] &&
+                 $transcripts{$id}->{map}->[-1]->[1] == $exon->[1]);
+
+        # Exon start, exon end (both 0-based, inclusive), offset from transcript's 5'end (plus strand)
+        push(@{$transcripts{$id}->{map}}, [$exon->[0], $exon->[1], $cumulative]);
+        $cumulative += abs(diff($exon->[0], $exon->[1])) + 1;
+
+    }
+
+    $transcripts{$id}->{length} = $cumulative;
+
+    # Free unused memory
+    delete($transcripts{$id}->{exons});
+
+    # The transcript's genomic span, used to index it for the sweep. Blocks are sorted by
+    # start, but a malformed annotation may contain overlapping ones, so the rightmost
+    # base is taken as the maximum over all block ends rather than the last block's end
+    my ($tStart, $tEnd) = @{$transcripts{$id}->{map}->[0]}[0, 1];
+
+    foreach my $exon (@{$transcripts{$id}->{map}}) { $tEnd = $exon->[1] if ($exon->[1] > $tEnd); }
+
+    push(@{$byChrom{$transcripts{$id}->{chrom}}}, [$tStart, $tEnd, $id]);
+
+}
+
+# Sorting each chromosome's transcripts by start is what lets the sweep advance
+# monotonically, pulling every transcript into the cache exactly once
+foreach my $chrom (keys %byChrom) {
+
+    @{$byChrom{$chrom}} = sort { $a->[0] <=> $b->[0] ||
+                                 $a->[1] <=> $b->[1] } @{$byChrom{$chrom}};
+
+}
+
+print "\n[+] Importing features...";
+
+open($fh, "<", $bedFile) or die "\n\n[!] Error: Unable to read from BED feature file ($!)\n\n";
+open(my $th, ">", ".${tmpFile}.features.bed") or die "\n\n[!] Error: Unable to write temporary feature file ($!)\n\n";
+select((select($th), $|=1)[0]);
+
+while(<$fh>) {
+
+    chomp($_);
+
+    my ($name, $score, $strand, @row);
+    @row = split /\t/;
+
+    next if (@row < 3);
+
+    if (!isint($row[1]) || !isint($row[2]) || $row[2] <= $row[1]) {
+
+        warn "\n\n[!] Warning: Skipping malformed BED entry (" . join("\t", @row[0..2]) . ")\n";
+        $nSkipped++;
+
+        next;
+
+    }
+
+    $name = @row > 3 && $row[3] ne "" ? $row[3] : "feature_" . ($nFeatures + 1);
+    $score = @row > 4 && $row[4] ne "" ? $row[4] : ".";
+    $strand = @row > 5 && $row[5] =~ m/^[+-]$/ ? $row[5] : ".";
+    $nUnstranded++ if ($strand eq ".");
+
+    # Columns 7+ are carried along, so that they can be re-emitted without having to
+    # keep the whole feature file in memory
+    print $th join("\t", $row[0], $row[1], $row[2], $name, $score, $strand,
+                   @row > 6 ? @row[6 .. $#row] : ()) . "\n";
+
+    $nFeatures++;
+
+}
+
+close($fh);
+close($th);
+
+if ($nFeatures) { print " $nFeatures features imported."; }
+else { die " 0 features imported.\n\n[!] Error: No valid feature imported\n\n"; }
+
+if ($nUnstranded) {
+
+    if ($sameStrand) {
+
+        die "\n\n[!] Error: $nUnstranded/$nFeatures features have no strand information (column 6)." .
+            "\n      These can never match under --sameStrand. Please either add the strand, or drop --sameStrand\n\n" if ($nUnstranded == $nFeatures);
+
+        warn "\n\n[!] Warning: $nUnstranded features have no strand information (column 6) and will be" .
+             "\n               discarded, as they can never match under --sameStrand\n";
+
+    }
+    else { print "\n[i] $nUnstranded features have no strand information (column 6). These will be mapped onto" .
+                 "\n    transcripts on both strands, and reported with a \".\" in the strand column."; }
+
+}
+
+print "\n[+] Sorting features...";
+
+# The sweep requires the features to be sorted by chromosome and start coordinate; the
+# annotation needs no sorting on disk, as it is indexed in memory (see %byChrom)
+system("LC_ALL=C sort -k 1,1 -k 2,2n .${tmpFile}.features.bed > .${tmpFile}.features.sorted.bed");
+
+die "\n\n[!] Error: Unable to sort the feature file\n\n" if (!-e ".${tmpFile}.features.sorted.bed");
+
+print "\n[+] Mapping features onto transcripts...";
+
+open(my $wh, ">", $output) or die "\n\n[!] Error: Unable to write to output file ($!)\n\n";
+select((select($wh), $|=1)[0]);
+
+print $wh join("\t", qw(#transcriptId start end name score strand genomicLocus featureStrand
+                        transcriptStrand overlap exonsSpanned type extraFields)) . "\n";
+
+open($fh, "<", ".${tmpFile}.features.sorted.bed") or die "\n\n[!] Error: Unable to read from sorted feature file ($!)\n\n";
+while(<$fh>) {
+
+    chomp($_);
+
+    my (@row);
+    @row = split /\t/;
+
+    next if (@row < 6);
+
+    # Features with no strand can never match under --sameStrand
+    next if ($sameStrand && $row[5] eq ".");
+
+    %feature = ( chrom  => $row[0],
+                 start  => $row[1],
+                 end    => $row[2],
+                 name   => $row[3],
+                 score  => $row[4],
+                 strand => $row[5],
+                 extra  => @row > 6 ? join("\t", @row[6 .. $#row]) : "." );
+    %pieces = ();
+
+    foreach my $id (sweep($row[0], $row[1], $row[2] - 1)) {
+
+        next if ($sameStrand && $row[5] ne $transcripts{$id}->{strand});
+
+        # Trims the feature to each block's boundaries (0-based, inclusive). Transcripts
+        # whose span overlaps the feature, but all of whose blocks miss it (i.e. purely
+        # intronic features), simply contribute no piece and are dropped
+        foreach my $exon (@{$transcripts{$id}->{map}}) {
+
+            my ($pieceStart, $pieceEnd);
+            $pieceStart = max($row[1], $exon->[0]);
+            $pieceEnd = min($row[2] - 1, $exon->[1]);
+
+            next if ($pieceEnd < $pieceStart);
+
+            push(@{$pieces{$id}}, [$pieceStart, $pieceEnd]);
+
+        }
+
+    }
+
+    mapFeature($wh) if (%pieces);
+
+}
+close($fh);
+
+close($wh);
+
+cleanup();
+
+if ($nMapped) { print "\n[i] $nMapped feature/transcript pairs written."; }
+else { print "\n[!] Warning: No feature overlapped any annotated transcript."; }
+
+print "\n[!] Warning: $nSkipped malformed BED entries were skipped." if ($nSkipped);
+
+print "\n\n[+] All done.\n\n";
+
+sub cleanup { unlink glob ".${tmpFile}.*"; }
+
+sub mapFeature {
+
+    my $wh = shift;
+
+    foreach my $id (sort keys %pieces) {
+
+        my ($covered, $nExons, $min, $max,
+            $start, $end, $length, $type,
+            $relStrand);
+        $covered = 0;
+        $nExons = 0;
+        $length = abs(diff($feature{start}, $feature{end}));
+
+        foreach my $piece (@{$pieces{$id}}) {
+
+            my ($relStart, $relEnd);
+            $relStart = genomeToTranscript($id, $piece->[0]);
+            $relEnd = genomeToTranscript($id, $piece->[1]);
+
+            next if (!defined $relStart || !defined $relEnd);
+
+            $covered += abs(diff($piece->[0], $piece->[1])) + 1;
+            $nExons++;
+
+            foreach my $coord ($relStart, $relEnd) {
+
+                $min = $coord if (!defined $min || $coord < $min);
+                $max = $coord if (!defined $max || $coord > $max);
+
+            }
+
+        }
+
+        next if (!defined $min);
+
+        # A feature is "clipped" only if one of its two ends does not fall within an exon of
+        # this transcript (a feature spanning an intron, but with both ends falling within
+        # exons, is simply "spliced", hence shorter than its genomic counterpart)
+        $type = defined genomeToTranscript($id, $feature{start}) &&
+                defined genomeToTranscript($id, $feature{end} - 1) ? ($nExons > 1 ? "spliced" : "complete") : "clipped";
+
+        next if ($fullOnly && $type eq "clipped");
+        next if (defined $minOverlap && $covered / $length < $minOverlap);
+
+        ($start, $end) = ($min, $max);
+
+        # Inverts the relative coordinates with respect to the transcript's end
+        # if the transcript is on the minus strand
+        if ($transcripts{$id}->{strand} eq "-") {
+
+            ($start, $end) = ($transcripts{$id}->{length} - 1 - $max,
+                              $transcripts{$id}->{length} - 1 - $min);
+
+        }
+
+        # Back to BED half-open coordinates
+        $end++;
+
+        $relStrand = $feature{strand} eq "." ? "." : ($feature{strand} eq $transcripts{$id}->{strand} ? "+" : "-");
+
+        print $wh join("\t", $id, $start, $end, $feature{name}, $feature{score}, $relStrand,
+                       $feature{chrom} . ":" . $feature{start} . "-" . $feature{end},
+                       $feature{strand}, $transcripts{$id}->{strand}, $covered . "/" . $length,
+                       $nExons, $type, $feature{extra}) . "\n";
+
+        $nMapped++;
+
+    }
+
+}
+
+sub sweep {
+
+    my ($chrom, $start, $end) = @_;
+
+    my ($list, @hits);
+    $list = $byChrom{$chrom};
+
+    return() if (!defined $list);
+
+    # The sweep only ever moves forward, so its state is reset whenever the feature stream
+    # jumps to another chromosome or back along the current one. With a properly sorted
+    # feature file this never happens after the first feature of each chromosome, and every
+    # transcript is pulled into the cache exactly once, for O(features + transcripts) overall
+    if (!defined $sweepChrom || $sweepChrom ne $chrom || $start < $sweepLast) {
+
+        $sweepChrom = $chrom;
+        $sweepPtr = 0;
+        @sweepCache = ();
+
+    }
+
+    $sweepLast = $start;
+
+    # Drops the transcripts ending before the current feature: since feature starts are
+    # non-decreasing, no subsequent feature can overlap them either
+    @sweepCache = grep { $_->[1] >= $start } @sweepCache;
+
+    # Pulls in every transcript starting at or before the feature's end, keeping those
+    # that have not already ended
+    while ($sweepPtr < scalar(@{$list}) && $list->[$sweepPtr]->[0] <= $end) {
+
+        push(@sweepCache, $list->[$sweepPtr]) if ($list->[$sweepPtr]->[1] >= $start);
+        $sweepPtr++;
+
+    }
+
+    # Every cached transcript ends at/after the feature's start, but one pulled in by an
+    # earlier, longer feature may start after this one's end, so that is checked here
+    foreach my $entry (@sweepCache) { push(@hits, $entry->[2]) if ($entry->[0] <= $end); }
+
+    return(@hits);
+
+}
+
+sub genomeToTranscript {
+
+    my ($id, $position) = @_;
+
+    my ($map, $low, $high);
+    $map = $transcripts{$id}->{map};
+    ($low, $high) = (0, $#{$map});
+
+    while ($low <= $high) {
+
+        my $mid = int(($low + $high) / 2);
+
+        if ($position < $map->[$mid]->[0]) { $high = $mid - 1; }
+        elsif ($position > $map->[$mid]->[1]) { $low = $mid + 1; }
+        else { return($map->[$mid]->[2] + $position - $map->[$mid]->[0]); }
+
+    }
+
+    return;
+
+}
+
+sub bedToBlocks {
+
+    my @row = @_;
+
+    my (@blocks, @sizes, @starts);
+
+    # BED4/BED6 records (and BED12 records with no usable block definition) describe a
+    # single, unspliced block spanning the whole entry
+    return([[$row[1], $row[2]]]) if (@row < 12 || !isint($row[9]) || $row[9] < 1);
+
+    $row[10] =~ s/\s+//g;
+    $row[11] =~ s/\s+//g;
+    @sizes = split(/,/, $row[10]);
+    @starts = split(/,/, $row[11]);
+
+    return if (@sizes != $row[9] || @starts != $row[9]);
+
+    for (my $i = 0; $i < @sizes; $i++) {
+
+        my $start;
+
+        return if (!isint($sizes[$i]) || !isint($starts[$i]) ||
+                   $sizes[$i] < 1 || $starts[$i] < 0);
+
+        # blockStarts are relative to chromStart, and the last block must end at chromEnd
+        $start = $row[1] + $starts[$i];
+
+        return if ($start + $sizes[$i] > $row[2]);
+
+        push(@blocks, [$start, $start + $sizes[$i]]);
+
+    }
+
+    return(\@blocks);
+
+}
+
+sub help {
+
+    print "\n[!] Error: Invalid option. Please check the help\n" if ($_[0]);
+
+    die <<HELP;
+
+ genome2transcriptome (using RNAFramework libs v$Core::Utils::VERSION)
+
+ Summary: Given a BED/GTF gene annotation and a BED file of genomic features, converts the
+          features into transcript (spliced) coordinates
+
+ Usage:   genome2transcriptome -af annotation.gtf input.bed
+
+ Options                                    Description
+ -o  or --output                <string>    Output directory (Default: <input>.transcriptomeLevel.bed)
+ -ow or --overwrite                         Overwrites output directory (if the specified path already exists)
+ -af or --annoFile              <string>    Path to a BED/GTF file containing the gene annotation
+ -ga or --GTFattrib             <string>    GTF attribute to be used as the transcript identifier (Default: transcript_id)
+ -gf or --gtfFeature            <string>    GTF feature type defining the transcript's blocks (Default: exon)
+ -ss or --sameStrand                        Only maps features onto transcripts on the same strand
+                                            Note: features lacking strand information (column 6, or "." ) can never match
+                                                  under this option, and will be discarded
+ -mo or --minOverlap            <float>     Minimum fraction of the feature's bases that must fall within the exons of a
+                                            transcript for the mapping to be reported (0-1, Default: 1 bp of overlap)
+ -fo or --fullyOverlapping                  Only reports features whose both ends fall within exons of the transcript
+                                            (by default, features extending into introns/outside the transcript are trimmed to their
+                                            exonic portion and flagged as "clipped")
+
+ Output fields:
+
+    1.  transcriptId        Transcript identifier (from the specified GTF attribute)
+    2.  start               Feature start, in transcript coordinates (0-based)
+    3.  end                 Feature end, in transcript coordinates (inclusive)
+    4.  name                Feature name (from column 4 of the input BED, or auto-generated)
+    5.  score               Feature score (from column 5 of the input BED)
+    6.  strand              Feature strand, relative to the transcript
+    7.  genomicLocus        Original genomic locus of the feature (0-based)
+    8.  featureStrand       Genomic strand of the feature
+    9.  transcriptStrand    Genomic strand of the transcript
+    10. Overlap             Exonic bases of the feature/total length of the feature
+    11. exonsSpanned        Number of exons overlapped by the feature
+    12. type                "complete" (fully exonic, single exon), "spliced" (fully exonic, spanning
+                            exon junctions, hence shorter than the genomic feature), or "clipped" (partly
+                            intronic/outside the transcript, trimmed to the exonic portion)
+    13. extraFields         Columns 7+ of the input BED (or "." if absent)
+
+HELP
+
+}

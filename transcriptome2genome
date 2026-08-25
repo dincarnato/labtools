@@ -39,7 +39,7 @@ die "\n[!] Error: No input BED file provided\n\n" if (!$input);
 die "\n[!] Error: No annotation file specified\n\n" if (!$annoFile);
 die "\n[!] Error: Specified annotation file does not exist\n\n" if (!-e $annoFile);
 
-$isGTF = 1 if (substr($annoFile, -3) eq "gtf");
+$isGTF = 1 if ($annoFile !~ /\.bed$/i);
 
 print "\n[+] Importing annotation file...";
 

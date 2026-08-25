@@ -1,0 +1,84 @@
+#!/usr/bin/perl
+
+##
+# BED2GTF (v0.1)
+#
+# Author:  Danny Incarnato (dincarnato[at]rnaframework.com)
+# Summary: Converts a BED file to GTF format
+##
+
+use strict;
+use Getopt::Long;
+
+my ($output, $file);
+
+do {
+    
+    local $SIG{__WARN__} = sub { };
+
+    GetOptions( "o|output=s" => \$output ) or help();
+
+    $file = $ARGV[0];
+
+};
+
+die "\n  [!] Error: No input BED file has been specified\n\n" unless(defined $file);
+die "\n  [!] Error: Input BED file doesn't exist\n\n" unless(-e $file);
+
+if (!$output) {
+    
+    $output = $file;
+    $output =~ s/\/?(.+?)(?:.bed)?$/$1/;
+    $output .= ".gtf";
+    
+}
+
+open(my $fh, "<", $file) or die "\n  [!] Error: Unable to open input GTF file ($!)\n\n";
+open(my $wh, ">", $output) or die "\n  [!] Error: Unable to write output BED file ($!)\n\n";
+
+while(<$fh>) {
+    
+    chomp($_);
+    
+    my (@line, @start, @len);
+    @line = split(/\t/, $_);
+    
+    next unless(@line == 12);
+    
+    @len = split(/,/, $line[10]);
+    @start = split(/,/, $line[11]);
+    
+    print $wh $line[0] . "\tBED2GTF\ttranscript\t" . ($line[1] + 1) . "\t" . $line[2] . "\t.\t" . $line[5] .
+              "\t.\tgene_id \"" . $line[3] . "\"; transcript_id \"" . $line[3] . "\";\n";
+    
+    for (0 .. @start - 1) {
+        
+        $start[$_] += $line[1];
+        
+        print $wh $line[0] . "\tBED2GTF\texon\t" . ($start[$_] + 1) . "\t" . ($start[$_] + $len[$_]) . "\t.\t" . $line[5] .
+                  "\t.\tgene_id \"" . $line[3] . "\"; transcript_id \"" . $line[3] . "\"; exon_number \"" . ($_ + 1) . "\";\n";
+        
+    }
+    
+}
+
+close($wh);
+close($fh);
+
+sub help {
+    
+    die <<HELP;
+ 
+ BED2GTF (v0.1)
+    
+ Author:  Danny Incarnato (dincarnato[at]rnaframework.com)
+ Summary: Converts a BED file to GTF format
+ 
+ Usage:   bed2gtf [Options] transcripts.bed
+ 
+ Options               Description
+ -o or --output        Converted BED file (Default: <input>.gtf)
+ 
+HELP
+    
+}
